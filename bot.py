@@ -106,48 +106,40 @@ def extract_metadata(input_path: str) -> dict:
 
 
 def convert_book(input_path: str, output_path: str, output_format: str) -> tuple[bool, str]:
-    """Конвертирует книгу с абсолютными путями и явным указанием формата"""
+    """Конвертирует книгу с явным указанием формата вывода (обязательно для малинки)"""
     try:
-        # Преобразуем в абсолютные пути (критически важно для ebook-convert)
+        # Абсолютные пути
         input_abs = str(Path(input_path).resolve())
         output_abs = str(Path(output_path).resolve())
         
-        # Проверяем существование входного файла
+        # Проверка файла
         input_p = Path(input_abs)
         if not input_p.exists():
             return False, f"Входной файл не найден: {input_abs}"
-        
         if input_p.stat().st_size == 0:
-            return False, f"Входной файл пустой: {input_abs} (0 байт)"
+            return False, f"Входной файл пустой: {input_abs}"
         
-        logger.info(f"Начало конвертации: {input_abs} → {output_abs} ({output_format})")
-        logger.info(f"Размер входного файла: {input_p.stat().st_size / 1024:.1f} КБ")
+        logger.info(f"Конвертация: {input_abs} → {output_abs} ({output_format})")
         
-        # Проверяем свободное место
-        free_space = shutil.disk_usage("/").free
-        if free_space < 50 * 1024 * 1024:  # 50 МБ
-            return False, f"Мало свободного места на диске: {free_space / 1024 / 1024:.1f} МБ"
+        # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: явное указание --output-format
+        # Старые версии Calibre на малинке НЕ определяют формат по расширению!
+        output_format_map = {
+            "azw3": "azw3",
+            "epub": "epub",
+            "mobi": "mobi"
+        }
+        actual_format = output_format_map.get(output_format, "azw3")
         
-        # Ключевое исправление: абсолютные пути + явное расширение
+        # Минимальная рабочая команда (без лишних опций, которые могут ломать старые версии)
         cmd = [
             "ebook-convert",
-            input_abs,      # Абсолютный путь ко входному файлу
-            output_abs,     # Абсолютный путь к выходному файлу С расширением
-            "--output-profile", "kindle_pw3",
-            "--preserve-cover-aspect-ratio",
-            "--margin-left", "0",
-            "--margin-right", "0",
-            "--margin-top", "0",
-            "--margin-bottom", "0",
-            "--extra-css", "body { font-family: serif; line-height: 1.4; }",
+            input_abs,
+            output_abs,
+            "--output-format", actual_format,  # ← КРИТИЧЕСКИ ВАЖНО ДЛЯ МАЛИНКИ
         ]
         
-        if output_format == "mobi":
-            cmd.extend(["--mobi-keep-original-images", "--mobi-toc-at-start"])
+        logger.debug(f"Команда: {' '.join(cmd)}")
         
-        logger.debug(f"Команда конвертации: {' '.join(cmd)}")
-        
-        # Запускаем с таймаутом
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -158,31 +150,26 @@ def convert_book(input_path: str, output_path: str, output_format: str) -> tuple
         )
         
         output_p = Path(output_abs)
-        
         if result.returncode != 0:
             error_msg = (
-                f"Код ошибки: {result.returncode}\n"
-                f"Команда: {' '.join(cmd)}\n"
-                f"STDERR:\n{result.stderr[:800]}"
+                f"Код: {result.returncode}\n"
+                f"STDERR:\n{result.stderr[:1000]}"
             )
-            logger.error(f"Ошибка конвертации:\n{error_msg}")
+            logger.error(f"Ошибка:\n{error_msg}")
             return False, error_msg
         
         if not output_p.exists() or output_p.stat().st_size == 0:
-            error_msg = f"Выходной файл не создан. Размер: {output_p.stat().st_size if output_p.exists() else 'N/A'} байт"
-            logger.error(error_msg)
-            return False, error_msg
+            return False, f"Выходной файл не создан ({output_p.stat().st_size if output_p.exists() else 'N/A'} байт)"
         
-        logger.info(f"Конвертация успешна: {output_abs} ({output_p.stat().st_size / 1024:.1f} КБ)")
+        logger.info(f"Успех: {output_abs} ({output_p.stat().st_size / 1024:.1f} КБ)")
         return True, "OK"
         
-    except subprocess.TimeoutExpired as e:
-        logger.error(f"Таймаут конвертации: {e}")
-        return False, "Таймаут конвертации (более 180 секунд)"
+    except subprocess.TimeoutExpired:
+        return False, "Таймаут (180 сек)"
     except Exception as e:
-        logger.error(f"Исключение при конвертации: {e}", exc_info=True)
-        return False, f"Исключение: {type(e).__name__}: {str(e)[:200]}"
-
+        logger.error(f"Исключение: {e}", exc_info=True)
+        return False, f"{type(e).__name__}: {str(e)[:200]}"
+        
 
 async def conversion_worker(application: Application):
     """Воркер — обрабатывает очередь без блокировок"""

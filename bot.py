@@ -106,17 +106,21 @@ def extract_metadata(input_path: str) -> dict:
 
 
 def convert_book(input_path: str, output_path: str, output_format: str) -> tuple[bool, str]:
-    """Конвертирует книгу. Возвращает (успех, диагностическое сообщение)"""
+    """Конвертирует книгу с абсолютными путями и явным указанием формата"""
     try:
+        # Преобразуем в абсолютные пути (критически важно для ebook-convert)
+        input_abs = str(Path(input_path).resolve())
+        output_abs = str(Path(output_path).resolve())
+        
         # Проверяем существование входного файла
-        input_p = Path(input_path)
+        input_p = Path(input_abs)
         if not input_p.exists():
-            return False, f"Входной файл не найден: {input_path}"
+            return False, f"Входной файл не найден: {input_abs}"
         
         if input_p.stat().st_size == 0:
-            return False, f"Входной файл пустой: {input_path} (0 байт)"
+            return False, f"Входной файл пустой: {input_abs} (0 байт)"
         
-        logger.info(f"Начало конвертации: {input_path} → {output_path} ({output_format})")
+        logger.info(f"Начало конвертации: {input_abs} → {output_abs} ({output_format})")
         logger.info(f"Размер входного файла: {input_p.stat().st_size / 1024:.1f} КБ")
         
         # Проверяем свободное место
@@ -124,11 +128,11 @@ def convert_book(input_path: str, output_path: str, output_format: str) -> tuple
         if free_space < 50 * 1024 * 1024:  # 50 МБ
             return False, f"Мало свободного места на диске: {free_space / 1024 / 1024:.1f} МБ"
         
-        # Ключевое исправление: НЕТ опции --cover (она ломает конвертацию для FB2)
+        # Ключевое исправление: абсолютные пути + явное расширение
         cmd = [
             "ebook-convert",
-            str(input_p),
-            output_path,
+            input_abs,      # Абсолютный путь ко входному файлу
+            output_abs,     # Абсолютный путь к выходному файлу С расширением
             "--output-profile", "kindle_pw3",
             "--preserve-cover-aspect-ratio",
             "--margin-left", "0",
@@ -136,7 +140,6 @@ def convert_book(input_path: str, output_path: str, output_format: str) -> tuple
             "--margin-top", "0",
             "--margin-bottom", "0",
             "--extra-css", "body { font-family: serif; line-height: 1.4; }",
-            "--verbose",  # Детальный вывод для диагностики
         ]
         
         if output_format == "mobi":
@@ -144,7 +147,7 @@ def convert_book(input_path: str, output_path: str, output_format: str) -> tuple
         
         logger.debug(f"Команда конвертации: {' '.join(cmd)}")
         
-        # Запускаем с таймаутом и перехватом вывода
+        # Запускаем с таймаутом
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -154,31 +157,28 @@ def convert_book(input_path: str, output_path: str, output_format: str) -> tuple
             errors='replace'
         )
         
-        output_p = Path(output_path)
+        output_p = Path(output_abs)
         
         if result.returncode != 0:
             error_msg = (
                 f"Код ошибки: {result.returncode}\n"
-                f"STDOUT (первые 500 символов):\n{result.stdout[:500]}\n"
-                f"STDERR (первые 500 символов):\n{result.stderr[:500]}"
+                f"Команда: {' '.join(cmd)}\n"
+                f"STDERR:\n{result.stderr[:800]}"
             )
             logger.error(f"Ошибка конвертации:\n{error_msg}")
             return False, error_msg
         
         if not output_p.exists() or output_p.stat().st_size == 0:
-            error_msg = f"Выходной файл не создан или пустой. Размер: {output_p.stat().st_size if output_p.exists() else 'N/A'} байт"
+            error_msg = f"Выходной файл не создан. Размер: {output_p.stat().st_size if output_p.exists() else 'N/A'} байт"
             logger.error(error_msg)
             return False, error_msg
         
-        logger.info(f"Конвертация успешна: {output_path} ({output_p.stat().st_size / 1024:.1f} КБ)")
+        logger.info(f"Конвертация успешна: {output_abs} ({output_p.stat().st_size / 1024:.1f} КБ)")
         return True, "OK"
         
     except subprocess.TimeoutExpired as e:
-        logger.error(f"Таймаут конвертации (180 сек): {e}")
+        logger.error(f"Таймаут конвертации: {e}")
         return False, "Таймаут конвертации (более 180 секунд)"
-    except MemoryError:
-        logger.error("Нехватка памяти при конвертации")
-        return False, "Нехватка оперативной памяти (малинка 3 имеет только 1 ГБ RAM)"
     except Exception as e:
         logger.error(f"Исключение при конвертации: {e}", exc_info=True)
         return False, f"Исключение: {type(e).__name__}: {str(e)[:200]}"
@@ -446,7 +446,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_id = update.effective_user.id
     output_format = settings_db.get_preferred_format(user_id)
     
-    # Генерируем пути
+    # Генерируем АБСОЛЮТНЫЕ пути
+    base_tmp = Path.cwd() / "tmp"
+    base_tmp.mkdir(exist_ok=True)
+    
     task_id = str(uuid4())
     input_ext = Path(filename).suffix or ".fb2"
     output_ext = {"azw3": ".azw3", "epub": ".epub", "mobi": ".mobi"}[output_format]
@@ -456,8 +459,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "user_id": user_id,
         "file_id": document.file_id,
         "file_name": document.file_name,
-        "input_path": str(Path("tmp") / f"{task_id}{input_ext}"),
-        "output_path": str(Path("tmp") / f"{task_id}{output_ext}"),
+        "input_path": str(base_tmp / f"{task_id}{input_ext}"),
+        "output_path": str(base_tmp / f"{task_id}{output_ext}"),
         "output_format": output_format,
         "status": "queued",
         "queued_at": datetime.now(),
@@ -548,7 +551,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_commands))
     application.add_handler(CallbackQueryHandler(handle_format_setting, pattern="^setfmt:"))
 
-    logger.info("✅ Бот запущен с расширенной диагностикой!")
+    logger.info("✅ Бот запущен с абсолютными путями и постоянным меню!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

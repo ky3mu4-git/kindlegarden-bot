@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.env
+
+# Logs & temp files
+logs/
+tmp/
+
+# VS Code
+.vscode/*.json
+!.vscode/settings.json

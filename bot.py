@@ -49,11 +49,12 @@ MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
 def extract_metadata(input_path: str) -> dict:
     """Извлекает метаданные через ebook-meta"""
     try:
-        if not Path(input_path).exists() or Path(input_path).stat().st_size == 0:
+        input_p = Path(input_path)
+        if not input_p.exists() or input_p.stat().st_size == 0:
             return {"title": None, "authors": None, "has_cover": False}
         
         result = subprocess.run(
-            ["ebook-meta", input_path],
+            ["ebook-meta", str(input_p)],
             capture_output=True,
             text=True,
             timeout=30,
@@ -64,7 +65,7 @@ def extract_metadata(input_path: str) -> dict:
         metadata = {"title": None, "authors": None, "has_cover": False}
         
         # Проверяем обложку
-        if "cover" in result.stdout.lower() or "Cover image" in result.stdout:
+        if "cover" in result.stdout.lower() or "Cover image" in result.stdout or "Cover:" in result.stdout:
             metadata["has_cover"] = True
         
         # Извлекаем автора и название
@@ -72,32 +73,31 @@ def extract_metadata(input_path: str) -> dict:
             line = line.strip()
             if line.startswith("Title:") and len(line) > 6:
                 val = line[6:].strip()
-                if val and val.lower() != "unknown":
+                if val and val.lower() != "unknown" and val != "":
                     metadata["title"] = val
             elif line.startswith("Author(s):") and len(line) > 10:
                 val = line[10:].strip()
-                if val and val.lower() != "unknown":
+                if val and val.lower() != "unknown" and val != "":
                     metadata["authors"] = [a.strip() for a in val.split(",")]
         
         # Fallback из имени файла
-        if not metadata["title"] and Path(input_path).name:
-            fname = Path(input_path).name
+        if not metadata["title"] and input_p.name:
+            fname = input_p.name
             clean = re.sub(r'\.fb2.*$', '', fname, flags=re.IGNORECASE)
             clean = re.sub(r'[._-]+', ' ', clean)
-            metadata["title"] = clean.strip() or None
+            metadata["title"] = clean.strip() or "Без названия"
         
         logger.info(f"Метаданные: title={metadata['title']}, authors={metadata['authors']}, cover={metadata['has_cover']}")
         return metadata
         
     except Exception as e:
         logger.warning(f"Ошибка извлечения метаданных: {e}")
-        return {"title": None, "authors": None, "has_cover": False}
+        return {"title": "Без названия", "authors": None, "has_cover": False}
 
 
 def convert_book(input_path: str, output_path: str) -> tuple[bool, str]:
     """МИНИМАЛЬНАЯ рабочая конвертация — только пути, без опций"""
     try:
-        # Используем абсолютные пути без спецсимволов
         input_abs = str(Path(input_path).resolve())
         output_abs = str(Path(output_path).resolve())
         
@@ -105,13 +105,11 @@ def convert_book(input_path: str, output_path: str) -> tuple[bool, str]:
         if not input_p.exists() or input_p.stat().st_size == 0:
             return False, "Файл не найден или пустой"
         
-        # КРИТИЧЕСКИ ВАЖНО: только 2 аргумента — входной и выходной файлы
+        # Только 2 аргумента — входной и выходной файлы
         cmd = ["ebook-convert", input_abs, output_abs]
         
-        logger.info(f"Конвертация: {Path(input_abs).name} → {Path(output_abs).name}")
-        logger.debug(f"Полная команда: {' '.join(cmd)}")
+        logger.info(f"Конвертация: {input_p.name} → {Path(output_abs).name}")
         
-        # Запускаем без оболочки (shell=False по умолчанию)
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -123,8 +121,7 @@ def convert_book(input_path: str, output_path: str) -> tuple[bool, str]:
         
         output_p = Path(output_abs)
         if result.returncode != 0:
-            # Логируем полную ошибку для диагностики
-            logger.error(f"STDERR ebook-convert: {result.stderr}")
+            logger.error(f"STDERR ebook-convert: {result.stderr[:500]}")
             error_preview = result.stderr[:400].replace('\n', ' | ')
             return False, f"Код {result.returncode} | {error_preview}"
         
@@ -169,7 +166,7 @@ async def conversion_worker(application: Application):
             except Exception as e:
                 logger.warning(f"Не удалось обновить статус: {e}")
             
-            # Конвертируем БЕЗ ОПЦИЙ (минимальная рабочая конфигурация)
+            # Конвертируем БЕЗ ОПЦИЙ
             success, diag = convert_book(
                 task["input_path"],
                 task["output_path"]
@@ -237,8 +234,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Отправляй FB2/EPUB → получаешь книгу для Kindle!\n\n"
         "✅ Поддерживаемые форматы:\n"
         "• <b>AZW3</b> — рекомендуется для современных Kindle\n"
-        "• <b>EPUB</b> — универсальный формат\n"
-        "• <b>MOBI</b> — для старых устройств"
+        "• <b>EPUB</b> — универсальный формат (поддерживается с 2022 г.)\n"
+        "• <b>MOBI</b> — для очень старых устройств"
     )
     await update.message.reply_text(
         message,
@@ -249,16 +246,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = (
-        "📚 <b>Как получить лучший результат:</b>\n\n"
-        "1️⃣ <b>Проверь исходный файл:</b>\n"
-        "   • Открой FB2 в Calibre на ПК\n"
-        "   • Убедись, что есть обложка и заполнены «Автор»/«Название»\n\n"
-        "2️⃣ <b>Если метаданные пустые:</b>\n"
-        "   • В Calibre: ПКМ → «Редактировать метаданные»\n"
-        "   • Заполни поля и добавь обложку\n"
-        "   • Сохрани изменения (Ctrl+S)\n\n"
-        "3️⃣ <b>Отправь исправленный файл в бота</b>\n\n"
-        "💡 Бот автоматически извлекает метаданные и обложку из правильно оформленного FB2."
+        "📚 <b>Как пользоваться ботом:</b>\n\n"
+        "1️⃣ Отправь FB2 или EPUB файл (макс. 10 МБ)\n"
+        "2️⃣ Бот автоматически конвертирует его в выбранный формат\n"
+        "3️⃣ Получи файл с обложкой и метаданными для Kindle!\n\n"
+        "💡 <b>Важно:</b>\n"
+        "• Обложка и метаданные должны быть встроены в исходный файл\n"
+        "• Проверь файл в Calibre на ПК перед отправкой\n"
+        "• На малинке 3 конвертация занимает 15–60 секунд\n\n"
+        "⚙️ Изменить формат по умолчанию: кнопка «⚙️ Настройки»"
     )
     await update.message.reply_text(
         message,
@@ -290,7 +286,7 @@ async def handle_format_setting(update: Update, context: ContextTypes.DEFAULT_TY
     _, fmt = query.data.split(":")
     settings_db.set_preferred_format(update.effective_user.id, fmt)
     await query.edit_message_text(
-        f"✅ Формат по умолчанию: <b>{fmt.upper()}</b>",
+        f"✅ Формат по умолчанию установлен: <b>{fmt.upper()}</b>",
         parse_mode=ParseMode.HTML
     )
     await query.message.reply_text("Выбери действие:", reply_markup=MAIN_REPLY_KEYBOARD)
@@ -319,18 +315,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Проверяем очередь
     if conversion_queue.full():
         await update.message.reply_text(
-            f"⏸️ Очередь заполнена ({conversion_queue.qsize()}/5 файлов)",
+            f"⏸️ Очередь заполнена ({conversion_queue.qsize()}/5 файлов).\nПопробуй через минуту.",
             reply_markup=MAIN_REPLY_KEYBOARD
         )
         return
 
-    # Генерируем ПРОСТЫЕ имена файлов без спецсимволов
+    # Генерируем простые имена файлов без спецсимволов
     base_tmp = Path.cwd() / "tmp"
-    simple_id = str(uuid4()).replace("-", "")[:12]  # 12 символов без дефисов
+    simple_id = str(uuid4()).replace("-", "")[:12]
     input_ext = Path(filename).suffix or ".fb2"
     output_ext = f".{settings_db.get_preferred_format(update.effective_user.id)}"
     
-    # Формируем пути с простыми именами
     input_path = base_tmp / f"in_{simple_id}{input_ext}"
     output_path = base_tmp / f"out_{simple_id}{output_ext}"
     
@@ -350,16 +345,31 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     try:
         file = await context.bot.get_file(document.file_id)
         await file.download_to_drive(task_info["input_path"])
+        
+        # 🔑 ПРОВЕРКА 1: файл не пустой
         input_size = Path(task_info["input_path"]).stat().st_size
         if input_size == 0:
-            raise ValueError("Скачанный файл пустой")
-        logger.info(f"Файл скачан: {input_path.name} ({input_size / 1024:.1f} КБ)")
+            raise ValueError("Файл пустой (0 байт)")
+        
+        # 🔑 ПРОВЕРКА 2: для FB2 — валидный XML
+        if input_ext.lower() == ".fb2":
+            with open(task_info["input_path"], "rb") as f:
+                header = f.read(200).decode("utf-8", errors="ignore")
+                if "<?xml" not in header and "<FictionBook" not in header:
+                    raise ValueError("Файл не является валидным FB2 (отсутствует XML-структура)")
+        
+        logger.info(f"Файл принят: {input_path.name} ({input_size / 1024:.1f} КБ)")
     except Exception as e:
-        logger.error(f"Ошибка скачивания: {e}")
+        logger.error(f"Отклонён файл: {e}")
         await update.message.reply_text(
-            "❌ Ошибка при получении файла. Попробуй заново.",
+            f"❌ Некорректный файл: {str(e)}\n\nУбедись, что файл не повреждён и имеет правильную структуру.",
             reply_markup=MAIN_REPLY_KEYBOARD
         )
+        # Чистим временный файл
+        try:
+            Path(task_info["input_path"]).unlink(missing_ok=True)
+        except:
+            pass
         return
 
     # Ставим в очередь
@@ -379,7 +389,8 @@ async def handle_text_commands(update: Update, context: ContextTypes.DEFAULT_TYP
     text = update.message.text.strip()
     if text == "📚 Отправить книгу":
         await update.message.reply_text(
-            "📎 Прикрепи FB2 или EPUB файл (макс. 10 МБ)",
+            "📎 Прикрепи FB2 или EPUB файл (макс. 10 МБ)\n\n"
+            "💡 Совет: убедись, что в файле есть обложка и заполнены метаданные (автор/название)",
             reply_markup=MAIN_REPLY_KEYBOARD
         )
     elif text == "⚙️ Настройки":
@@ -410,7 +421,7 @@ async def post_init(application: Application) -> None:
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        logger.error("❌ Токен не найден! Создай .env с TELEGRAM_BOT_TOKEN")
+        logger.error("❌ Токен не найден! Создай файл .env с TELEGRAM_BOT_TOKEN")
         return
 
     application = Application.builder().token(token).post_init(post_init).build()
@@ -422,7 +433,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_commands))
     application.add_handler(CallbackQueryHandler(handle_format_setting, pattern="^setfmt:"))
 
-    logger.info("🚀 Бот запущен с минимальной конфигурацией конвертации!")
+    logger.info("🚀 Бот запущен! Макс. очередь: 5 файлов")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

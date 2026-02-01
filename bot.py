@@ -2,10 +2,9 @@ import asyncio
 import logging
 import os
 import subprocess
-import tempfile
 from pathlib import Path
 from uuid import uuid4
-from datetime import datetime, timedelta
+from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -37,10 +36,7 @@ Path("logs").mkdir(exist_ok=True)
 Path("tmp").mkdir(exist_ok=True)
 
 # ========== ГЛОБАЛЬНАЯ ОЧЕРЕДЬ ЗАДАЧ ==========
-# Максимум 5 файлов в очереди (защита от перегрузки малинки)
 conversion_queue = asyncio.Queue(maxsize=5)
-
-# Храним информацию о задачах: {task_id: {user_id, file_name, status, message_id}}
 active_tasks = {}
 
 
@@ -65,7 +61,7 @@ def convert_book(input_path: str, output_path: str, output_format: str) -> bool:
             cmd.extend(["--mobi-keep-original-images"])
         
         logger.info(f"Запуск конвертации: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)  # 3 минуты максимум
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         
         if result.returncode != 0:
             logger.error(f"Ошибка конвертации (код {result.returncode}):\n{result.stderr}")
@@ -88,7 +84,6 @@ async def conversion_worker(application: Application):
     
     while True:
         try:
-            # Ждём новую задачу из очереди
             task = await conversion_queue.get()
             task_id = task["task_id"]
             
@@ -112,13 +107,12 @@ async def conversion_worker(application: Application):
             # Чистим временные файлы
             _cleanup_temp_files(task["input_path"], task["output_path"])
             
-            # Помечаем задачу как завершённую
             conversion_queue.task_done()
             active_tasks.pop(task_id, None)
             
         except Exception as e:
             logger.error(f"Ошибка в воркере: {e}", exc_info=True)
-            await asyncio.sleep(5)  # Защита от спама ошибками
+            await asyncio.sleep(5)
 
 
 async def _update_status_message(application: Application, task_id: str, status_text: str):
@@ -254,18 +248,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # Проверяем переполнение очереди
     if conversion_queue.full():
-        remaining = 60  # секунд до повторной попытки
         await update.message.reply_text(
-            f"⏸️ Очередь заполнена (максимум 5 файлов).\n"
-            f"Попробуй отправить файл через ~{remaining} секунд.\n"
-            f"Сейчас в обработке: {conversion_queue.qsize()} файлов"
+            "⏸️ Очередь заполнена (максимум 5 файлов).\n"
+            f"Сейчас в обработке: {conversion_queue.qsize()} файлов\n"
+            "Попробуй отправить файл через минуту."
         )
         return
 
     # Генерируем уникальный ID задачи
     task_id = str(uuid4())
     input_ext = Path(filename).suffix or ".fb2"
-    output_ext = ".tmp"  # будет заменён после выбора формата
     
     # Сохраняем информацию о файле
     task_info = {
@@ -275,8 +267,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "file_name": document.file_name,
         "mime_type": document.mime_type,
         "input_path": str(Path("tmp") / f"{task_id}{input_ext}"),
-        "output_path": str(Path("tmp") / f"{task_id}{output_ext}"),
-        "output_format": None,  # будет задан позже
+        "output_path": "",  # будет задан после выбора формата
+        "output_format": None,
         "status": "awaiting_format",
         "queued_at": datetime.now(),
     }
@@ -314,9 +306,20 @@ async def handle_format_choice(update: Update, context: ContextTypes.DEFAULT_TYP
     task["output_format"] = output_format
     task["status"] = "queued"
     
-    # Обновляем расширение выходного файла
+    # Обновляем путь выходного файла
     output_ext = {"azw3": ".azw3", "epub": ".epub", "mobi": ".mobi"}[output_format]
-    task["output_path"] = str(Path(task["output_path"]).with_suffix(output_ext))
+    task["output_path"] = str(Path("tmp") / f"{task_id}{output_ext}")
+
+    # Скачиваем файл ДО постановки в очередь (чтобы не блокировать воркер)
+    try:
+        file = await context.bot.get_file(task["file_id"])
+        await file.download_to_drive(task["input_path"])
+        logger.info(f"Файл скачан: {task['input_path']}")
+    except Exception as e:
+        logger.error(f"Ошибка скачивания файла: {e}")
+        await query.edit_message_text("❌ Ошибка при скачивании файла. Попробуй отправить заново.")
+        active_tasks.pop(task_id, None)
+        return
 
     # Ставим в очередь
     try:
@@ -332,14 +335,12 @@ async def handle_format_choice(update: Update, context: ContextTypes.DEFAULT_TYP
             reply_markup=_get_cancel_keyboard(task_id)
         )
     except asyncio.QueueFull:
-        await query.edit_message_text(
-            "❌ Очередь переполнена. Попробуй позже."
-        )
+        await query.edit_message_text("❌ Очередь переполнена. Попробуй позже.")
         active_tasks.pop(task_id, None)
 
 
 async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отмена задачи из очереди (пока не началась конвертация)"""
+    """Отмена задачи из очереди"""
     query = update.callback_query
     await query.answer()
 
@@ -357,10 +358,9 @@ async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    # Удаляем задачу из очереди (хитрый способ — пересоздаём очередь без этой задачи)
-    # Для простоты MVP просто помечаем как отменённую и пропускаем в воркере
-    task["status"] = "cancelled"
+    # Удаляем задачу
     active_tasks.pop(task_id, None)
+    _cleanup_temp_files(task["input_path"], task["output_path"])
     
     await query.edit_message_text(
         f"🚫 Конвертация <b>{task['file_name']}</b> отменена.",
@@ -370,16 +370,22 @@ async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик команды /settings"""
-    queue_status = (
-        f"В очереди: {conversion_queue.qsize()} / {conversion_queue.maxsize} файлов"
-    )
     await update.message.reply_text(
-        "⚙️ <b>Настройки</b>\n\n"
-        f"Статус очереди:\n{queue_status}\n\n"
+        f"⚙️ <b>Настройки</b>\n\n"
+        f"Статус очереди:\n"
+        f"В обработке: {conversion_queue.qsize()} / {conversion_queue.maxsize} файлов\n\n"
         "Пока доступна только ручная выборка формата при каждой конвертации.\n"
         "В будущем появится возможность задать формат по умолчанию.",
         parse_mode=ParseMode.HTML,
     )
+
+
+# ========== ЗАПУСК БОТА ==========
+
+async def post_init(application: Application) -> None:
+    """Запускает воркер конвертации после старта бота"""
+    asyncio.create_task(conversion_worker(application))
+    logger.info("✅ Воркер конвертации запущен")
 
 
 def main() -> None:
@@ -403,13 +409,7 @@ def main() -> None:
         logger.error("Установи: sudo apt install calibre")
         return
 
-    application = Application.builder().token(token).build()
-
-    # Запускаем воркер конвертации
-    application.job_queue.run_once(
-        lambda _: asyncio.create_task(conversion_worker(application)),
-        when=0
-    )
+    application = Application.builder().token(token).post_init(post_init).build()
 
     # Регистрируем обработчики
     application.add_handler(CommandHandler("start", start))

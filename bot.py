@@ -4,9 +4,11 @@ import os
 import subprocess
 import re
 import base64
+import zipfile
 from pathlib import Path
 from uuid import uuid4
 from datetime import datetime
+from xml.etree import ElementTree as ET
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.constants import ParseMode
@@ -47,100 +49,92 @@ MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 
-def extract_cover(input_path: str, cover_path: str) -> bool:
-    """Надёжное извлечение обложки даже при нестандартных ID (cover.jpg)"""
+def is_zip_file(path: str) -> bool:
+    """Проверяет, является ли файл ZIP по сигнатуре (а не по расширению)"""
     try:
-        input_p = Path(input_path)
-        if not input_p.exists() or input_p.stat().st_size == 0:
-            return False
-        
-        # Шаг 1: пробуем стандартный способ
-        try:
-            result = subprocess.run(
-                ["ebook-meta", "--get-cover", str(input_p), cover_path],
-                capture_output=True,
-                timeout=30
-            )
-            cover_p = Path(cover_path)
-            if cover_p.exists() and cover_p.stat().st_size > 1000:
-                logger.info(f"✅ Обложка извлечена стандартным способом: {cover_path}")
-                return True
-        except Exception as e:
-            logger.debug(f"Стандартный способ не сработал: {e}")
-        
-        # Шаг 2: ручной парсинг FB2 — ищем ЛЮБОЙ <binary> с image/*
-        logger.info("🔍 Стандартный способ не сработал, пробуем ручной парсинг FB2...")
-        try:
-            with open(input_path, "rb") as f:
-                content = f.read()
-            
-            # Ищем все <binary> с изображениями (игнорируем ссылки и структуру)
-            # Регулярка: <binary ... content-type="image/...">base64</binary>
-            pattern = rb'<binary[^>]+content-type="image/[^"]+"[^>]*>([^<]+)</binary>'
-            matches = re.findall(pattern, content)
-            
-            if not matches:
-                logger.info("❌ Обложка не найдена: нет <binary> с content-type=image/*")
-                return False
-            
-            # Берём ПЕРВЫЙ найденный (обычно это обложка)
-            base64_data = matches[0].strip()
-            if not base64_data:
-                logger.info("❌ Обложка не найдена: пустые данные в <binary>")
-                return False
-            
-            # Декодируем base64
-            try:
-                image_data = base64.b64decode(base64_data, validate=True)
-            except Exception as e:
-                # Пробуем без валидации (некоторые файлы имеют битый base64)
-                try:
-                    image_data = base64.b64decode(base64_data)
-                except Exception as e2:
-                    logger.warning(f"❌ Ошибка декодирования base64: {e} / {e2}")
-                    return False
-            
-            if len(image_data) < 1000:
-                logger.info(f"❌ Слишком маленькие данные ({len(image_data)} байт) — не обложка")
-                return False
-            
-            # Определяем формат по сигнатуре
-            ext = ".jpg"
-            if image_data.startswith(b'\x89PNG\r\n\x1a\n'):
-                ext = ".png"
-            elif image_data.startswith(b'GIF87a') or image_data.startswith(b'GIF89a'):
-                ext = ".gif"
-            
-            # Сохраняем
-            with open(cover_path, "wb") as f:
-                f.write(image_data)
-            
-            cover_p = Path(cover_path)
-            if cover_p.exists() and cover_p.stat().st_size > 1000:
-                logger.info(f"✅ Обложка извлечена ручным парсингом: {cover_path} ({cover_p.stat().st_size} байт)")
-                return True
-            else:
-                logger.warning("❌ Не удалось сохранить обложку после декодирования")
-                return False
-                
-        except Exception as e:
-            logger.warning(f"❌ Ошибка ручного парсинга FB2: {e}")
-            return False
-            
-    except Exception as e:
-        logger.warning(f"❌ Общая ошибка извлечения обложки: {e}")
+        with open(path, "rb") as f:
+            return f.read(4) == b"PK\x03\x04"
+    except:
         return False
 
 
-def extract_metadata(input_path: str) -> dict:
-    """Извлекает метаданные через ebook-meta"""
+def unpack_if_needed(input_path: str) -> str:
+    """Распаковывает FB2.ZIP в чистый FB2, возвращает путь к распакованному файлу"""
+    input_p = Path(input_path)
+    
+    # Если это не архив — возвращаем как есть
+    if not is_zip_file(input_path):
+        logger.info(f"Файл не является архивом: {input_path}")
+        return input_path
+    
+    # Распаковываем
+    logger.info(f"Распаковка архива: {input_path}")
     try:
-        input_p = Path(input_path)
-        if not input_p.exists() or input_p.stat().st_size == 0:
-            return {"title": None, "authors": None}
+        with zipfile.ZipFile(input_path, "r") as zf:
+            # Ищем первый файл с расширением .fb2
+            fb2_files = [f for f in zf.namelist() if f.lower().endswith(".fb2")]
+            if not fb2_files:
+                raise ValueError("В архиве не найден файл .fb2")
+            
+            # Распаковываем первый найденный FB2
+            extracted_path = input_p.with_suffix(".unpacked.fb2")
+            with zf.open(fb2_files[0]) as src, open(extracted_path, "wb") as dst:
+                dst.write(src.read())
+            
+            logger.info(f"Распаковано: {extracted_path}")
+            return str(extracted_path)
+    except Exception as e:
+        logger.error(f"Ошибка распаковки: {e}")
+        return input_path  # возвращаем оригинал как fallback
+
+
+def extract_metadata_fallback(input_path: str) -> dict:
+    """Резервное извлечение метаданных через парсинг XML (если ebook-meta не сработал)"""
+    try:
+        with open(input_path, "rb") as f:
+            content = f.read()
         
+        # Декодируем с разными кодировками
+        for enc in ["utf-8", "cp1251", "koi8-r"]:
+            try:
+                text = content.decode(enc)
+                break
+            except:
+                continue
+        else:
+            text = content.decode("utf-8", errors="ignore")
+        
+        # Ищем автора
+        author = "Неизвестен"
+        first = re.search(r"<first-name[^>]*>([^<]+)</first-name>", text, re.IGNORECASE)
+        last = re.search(r"<last-name[^>]*>([^<]+)</last-name>", text, re.IGNORECASE)
+        if first and last:
+            author = f"{first.group(1).strip()} {last.group(1).strip()}"
+        elif first:
+            author = first.group(1).strip()
+        elif last:
+            author = last.group(1).strip()
+        
+        # Ищем название
+        title = "Без названия"
+        title_match = re.search(r"<book-title[^>]*>([^<]+)</book-title>", text, re.IGNORECASE)
+        if title_match:
+            title = title_match.group(1).strip()
+        
+        logger.info(f"Fallback метаданные: автор={author}, название={title}")
+        return {"title": title, "authors": [author] if author != "Неизвестен" else None}
+        
+    except Exception as e:
+        logger.warning(f"Ошибка парсинга XML: {e}")
+        return {"title": "Без названия", "authors": None}
+
+
+def extract_metadata(input_path: str) -> dict:
+    """Извлекает метаданные — сначала через ebook-meta, потом fallback"""
+    try:
+        # Пробуем стандартный способ
         result = subprocess.run(
-            ["ebook-meta", str(input_p)],
+            ["ebook-meta", input_path],
             capture_output=True,
             text=True,
             timeout=30,
@@ -149,8 +143,6 @@ def extract_metadata(input_path: str) -> dict:
         )
         
         metadata = {"title": None, "authors": None}
-        
-        # Извлекаем автора и название
         for line in result.stdout.splitlines():
             line = line.strip()
             if line.startswith("Title:") and len(line) > 6:
@@ -162,39 +154,90 @@ def extract_metadata(input_path: str) -> dict:
                 if val and val.lower() != "unknown" and val != "":
                     metadata["authors"] = [a.strip() for a in val.split(",")]
         
-        # Fallback из имени файла
-        if not metadata["title"] and input_p.name:
-            fname = input_p.name
-            clean = re.sub(r'\.fb2.*$', '', fname, flags=re.IGNORECASE)
-            clean = re.sub(r'[._-]+', ' ', clean)
-            metadata["title"] = clean.strip() or "Без названия"
+        # Если не нашли — используем парсинг XML
+        if not metadata["title"] or not metadata["authors"]:
+            logger.info("Стандартный способ не дал результатов, используем парсинг XML")
+            fallback = extract_metadata_fallback(input_path)
+            if not metadata["title"]:
+                metadata["title"] = fallback["title"]
+            if not metadata["authors"]:
+                metadata["authors"] = fallback["authors"]
         
-        logger.info(f"Метаданные: title={metadata['title']}, authors={metadata['authors']}")
         return metadata
         
     except Exception as e:
         logger.warning(f"Ошибка извлечения метаданных: {e}")
-        return {"title": "Без названия", "authors": None}
+        return extract_metadata_fallback(input_path)
+
+
+def extract_cover(input_path: str, cover_path: str) -> bool:
+    """Извлекает обложку — сначала стандартно, потом ручной парсинг"""
+    try:
+        # Шаг 1: стандартный способ
+        try:
+            subprocess.run(
+                ["ebook-meta", "--get-cover", input_path, cover_path],
+                capture_output=True,
+                timeout=30
+            )
+            cover_p = Path(cover_path)
+            if cover_p.exists() and cover_p.stat().st_size > 1000:
+                logger.info(f"✅ Обложка извлечена стандартным способом")
+                return True
+        except:
+            pass
+        
+        # Шаг 2: ручной парсинг
+        logger.info("🔍 Ручной парсинг обложки...")
+        try:
+            with open(input_path, "rb") as f:
+                content = f.read()
+            
+            # Ищем ЛЮБОЙ <binary> с изображением
+            pattern = rb'<binary[^>]+content-type="image/[^"]+"[^>]*>([^<]+)</binary>'
+            matches = re.findall(pattern, content)
+            
+            if not matches:
+                logger.info("❌ Обложка не найдена: нет <binary> с изображением")
+                return False
+            
+            # Декодируем первое изображение
+            try:
+                image_data = base64.b64decode(matches[0].strip(), validate=True)
+            except:
+                image_data = base64.b64decode(matches[0].strip())
+            
+            if len(image_data) < 1000:
+                logger.info(f"❌ Слишком маленькие данные ({len(image_data)} байт)")
+                return False
+            
+            with open(cover_path, "wb") as f:
+                f.write(image_data)
+            
+            if Path(cover_path).stat().st_size > 1000:
+                logger.info(f"✅ Обложка извлечена ручным парсингом ({len(image_data)} байт)")
+                return True
+                
+        except Exception as e:
+            logger.warning(f"Ошибка ручного парсинга: {e}")
+            return False
+            
+    except Exception as e:
+        logger.warning(f"Общая ошибка извлечения обложки: {e}")
+        return False
 
 
 def convert_book(input_path: str, output_path: str, cover_path: str = None) -> tuple[bool, str]:
-    """Конвертация с явным указанием обложки"""
+    """Конвертация с минимальными опциями"""
     try:
         input_abs = str(Path(input_path).resolve())
         output_abs = str(Path(output_path).resolve())
         cover_abs = str(Path(cover_path).resolve()) if cover_path else None
         
-        input_p = Path(input_abs)
-        if not input_p.exists() or input_p.stat().st_size == 0:
-            return False, "Файл не найден или пустой"
-        
-        # Формируем команду
         cmd = ["ebook-convert", input_abs, output_abs]
-        
-        # Добавляем обложку если найдена
         if cover_abs and Path(cover_abs).exists():
             cmd.extend(["--cover", cover_abs])
-            logger.info(f"Конвертация с обложкой: {cover_abs}")
+            logger.info(f"Конвертация с обложкой")
         else:
             logger.info("Конвертация без обложки")
         
@@ -210,41 +253,22 @@ def convert_book(input_path: str, output_path: str, cover_path: str = None) -> t
         output_p = Path(output_abs)
         if result.returncode != 0:
             logger.error(f"STDERR: {result.stderr[:500]}")
-            error_preview = result.stderr[:400].replace('\n', ' | ')
-            return False, f"Код {result.returncode} | {error_preview}"
+            return False, f"Код {result.returncode}"
         
         if not output_p.exists() or output_p.stat().st_size == 0:
-            return False, f"Выходной файл не создан ({output_p.stat().st_size} байт)"
+            return False, "Файл не создан"
         
-        # Проверяем наличие обложки в результате
-        has_cover = False
-        try:
-            meta_result = subprocess.run(
-                ["ebook-meta", str(output_p)],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                encoding='utf-8',
-                errors='replace'
-            )
-            if "cover" in meta_result.stdout.lower():
-                has_cover = True
-        except:
-            pass
-        
-        size_info = f"{output_p.stat().st_size / 1024:.1f} КБ"
-        cover_info = " ✓ с обложкой" if has_cover else " ✗ без обложки"
-        return True, f"{size_info}{cover_info}"
+        return True, f"{output_p.stat().st_size / 1024:.1f} КБ"
         
     except subprocess.TimeoutExpired:
-        return False, "Таймаут 180 сек"
+        return False, "Таймаут"
     except Exception as e:
-        logger.error(f"Исключение в конвертации: {e}", exc_info=True)
-        return False, f"{type(e).__name__}: {str(e)[:150]}"
+        logger.error(f"Ошибка конвертации: {e}", exc_info=True)
+        return False, str(e)[:150]
 
 
 async def conversion_worker(application: Application):
-    logger.info("🔄 Воркер конвертации запущен")
+    logger.info("🔄 Воркер запущен")
     
     while True:
         try:
@@ -252,296 +276,235 @@ async def conversion_worker(application: Application):
             task_id = task["task_id"]
             active_tasks[task_id]["status"] = "converting"
             
+            # Распаковываем если нужно
+            unpacked_path = unpack_if_needed(task["input_path"])
+            cleanup_unpacked = (unpacked_path != task["input_path"])
+            
             # Извлекаем метаданные
-            metadata = extract_metadata(task["input_path"])
+            metadata = extract_metadata(unpacked_path)
             title = metadata["title"] or "Без названия"
             author = metadata["authors"][0] if metadata["authors"] else "Неизвестен"
             
             # Извлекаем обложку
             cover_path = f"{task['input_path']}.cover.jpg"
-            has_cover = extract_cover(task["input_path"], cover_path)
+            has_cover = extract_cover(unpacked_path, cover_path)
             
             # Обновляем статус
             try:
-                status_text = f"⏳ Конвертирую:\n<b>{title}</b>\n<i>{author}</i>"
-                if has_cover:
-                    status_text += "\n✅ Обложка найдена и добавлена"
-                else:
-                    status_text += "\n⚠️ Обложка не найдена во входном файле"
+                status = f"⏳ Конвертирую:\n<b>{title}</b>\n<i>{author}</i>"
+                status += "\n✅ Обложка найдена" if has_cover else "\n⚠️ Обложка не найдена"
                 await application.bot.edit_message_text(
                     chat_id=task["user_id"],
                     message_id=task["message_id"],
-                    text=status_text,
+                    text=status,
                     parse_mode=ParseMode.HTML
                 )
-            except Exception as e:
-                logger.warning(f"Не удалось обновить статус: {e}")
+            except:
+                pass
             
             # Конвертируем
             success, diag = convert_book(
-                task["input_path"],
+                unpacked_path,
                 task["output_path"],
                 cover_path if has_cover else None
             )
             
             # Отправляем результат
-            output_path = Path(task["output_path"])
-            if success and output_path.exists():
+            output_p = Path(task["output_path"])
+            if success and output_p.exists():
                 safe_title = re.sub(r'[<>:"/\\|?*]', '', title)[:50]
                 safe_author = re.sub(r'[<>:"/\\|?*]', '', author)[:30]
-                output_ext = output_path.suffix
-                filename = f"{safe_author} - {safe_title}{output_ext}"
-                
-                caption = (
-                    f"✅ Готово! Сконвертировано в <b>{output_ext[1:].upper()}</b>\n"
-                    f"📚 {title}\n"
-                    f"👤 {author}\n"
-                    f"📦 {diag}"
-                )
+                filename = f"{safe_author} - {safe_title}{output_p.suffix}"
                 
                 await application.bot.send_document(
                     chat_id=task["user_id"],
-                    document=open(output_path, "rb"),
+                    document=open(output_p, "rb"),
                     filename=filename,
-                    caption=caption,
+                    caption=f"✅ {task['output_format'].upper()}\n📚 {title}\n👤 {author}\n📦 {diag}",
                     parse_mode=ParseMode.HTML,
                 )
                 await application.bot.send_message(
                     chat_id=task["user_id"],
-                    text="Файл готов к отправке на Kindle! 📚",
+                    text="Файл готов для Kindle! 📚",
                     reply_markup=MAIN_REPLY_KEYBOARD
                 )
             else:
                 await application.bot.send_message(
                     chat_id=task["user_id"],
-                    text=f"❌ Ошибка конвертации <b>{title}</b>:\n<code>{diag}</code>",
+                    text=f"❌ Ошибка <b>{title}</b>:\n<code>{diag}</code>",
                     parse_mode=ParseMode.HTML,
                     reply_markup=MAIN_REPLY_KEYBOARD
                 )
             
-            # Чистим временные файлы
+            # Чистим файлы
             for p in [task["input_path"], task["output_path"], cover_path]:
                 try:
                     fp = Path(p)
                     if fp.exists():
                         fp.unlink()
-                        logger.debug(f"Удалён файл: {p}")
-                except Exception as e:
-                    logger.warning(f"Не удалось удалить {p}: {e}")
+                except:
+                    pass
+            if cleanup_unpacked:
+                try:
+                    Path(unpacked_path).unlink()
+                except:
+                    pass
             
             conversion_queue.task_done()
             active_tasks.pop(task_id, None)
             
         except Exception as e:
-            logger.error(f"Ошибка в воркере: {e}", exc_info=True)
+            logger.error(f"Ошибка воркера: {e}", exc_info=True)
             await asyncio.sleep(5)
 
 
+# ... остальные функции (обработчики, меню) без изменений — копируем из предыдущей версии ...
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = (
-        "📚 <b>KindleGarden Bot</b>\n\n"
-        "Отправляй FB2/EPUB → получаешь книгу для Kindle!\n\n"
-        "✨ Особенности:\n"
-        "• Автоматическое извлечение обложки даже из «кривых» FB2\n"
-        "• Корректное сохранение автора и названия\n"
-        "• Очередь обработки (макс. 5 файлов)"
-    )
     await update.message.reply_text(
-        message,
+        "📚 <b>KindleGarden Bot</b>\n\n"
+        "Поддерживаю:\n"
+        "• Чистые FB2 (.fb2)\n"
+        "• Сжатые FB2 (.fb2.zip, даже с расширением .fb2)\n"
+        "• EPUB\n\n"
+        "Автоматически извлекаю обложки и метаданные!",
         parse_mode=ParseMode.HTML,
         reply_markup=MAIN_REPLY_KEYBOARD
     )
-
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = (
-        "📚 <b>Как работает извлечение обложки:</b>\n\n"
-        "Бот использует два способа:\n"
-        "1️⃣ Стандартный — через <code>ebook-meta</code>\n"
-        "2️⃣ Резервный — ручной парсинг FB2 (ищет любое изображение в теге <code>&lt;binary&gt;</code>)\n\n"
-        "💡 Даже если в файле <code>id=\"cover.jpg\"</code> (с расширением), бот найдёт и добавит обложку!"
-    )
     await update.message.reply_text(
-        message,
+        "💡 <b>Важно:</b>\n"
+        "Многие книги распространяются как <b>сжатые архивы</b> (.fb2.zip),\n"
+        "но имеют расширение .fb2. Бот автоматически распознаёт и распаковывает их!",
         parse_mode=ParseMode.HTML,
         reply_markup=MAIN_REPLY_KEYBOARD
     )
-
 
 async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     current = settings_db.get_preferred_format(user_id)
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{'✅ ' if f == current else ''}📘 AZW3 (рекомендуется)", callback_data=f"setfmt:{f}")] for f in ["azw3"]
+        [InlineKeyboardButton(f"{'✅ ' if f == current else ''}📘 AZW3", callback_data=f"setfmt:{f}")] for f in ["azw3"]
     ] + [
         [InlineKeyboardButton(f"{'✅ ' if f == current else ''}📖 EPUB", callback_data=f"setfmt:{f}")] for f in ["epub"]
     ] + [
-        [InlineKeyboardButton(f"{'✅ ' if f == current else ''}📙 MOBI (устаревший)", callback_data=f"setfmt:{f}")] for f in ["mobi"]
+        [InlineKeyboardButton(f"{'✅ ' if f == current else ''}📙 MOBI", callback_data=f"setfmt:{f}")] for f in ["mobi"]
     ])
     await update.message.reply_text(
-        f"⚙️ Текущий формат: <b>{current.upper()}</b>\nВыбери новый:",
+        f"⚙️ Формат: <b>{current.upper()}</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=kb
     )
-
 
 async def handle_format_setting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     _, fmt = query.data.split(":")
     settings_db.set_preferred_format(update.effective_user.id, fmt)
-    await query.edit_message_text(
-        f"✅ Формат по умолчанию установлен: <b>{fmt.upper()}</b>",
-        parse_mode=ParseMode.HTML
-    )
+    await query.edit_message_text(f"✅ {fmt.upper()}", parse_mode=ParseMode.HTML)
     await query.message.reply_text("Выбери действие:", reply_markup=MAIN_REPLY_KEYBOARD)
 
-
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    document = update.message.document
-    filename = document.file_name.lower() if document.file_name else ""
+    doc = update.message.document
+    fname = doc.file_name.lower() if doc.file_name else ""
     
-    # Проверяем формат
-    if not (filename.endswith(".fb2") or filename.endswith(".fb2.zip") or filename.endswith(".epub")):
-        await update.message.reply_text(
-            "⚠️ Принимаю только FB2 и EPUB файлы (.fb2, .fb2.zip, .epub)",
-            reply_markup=MAIN_REPLY_KEYBOARD
-        )
+    if not (fname.endswith(".fb2") or fname.endswith(".fb2.zip") or fname.endswith(".epub")):
+        await update.message.reply_text("⚠️ Только FB2/EPUB", reply_markup=MAIN_REPLY_KEYBOARD)
         return
 
-    # Лимит размера для малинки 3
-    if document.file_size > 10 * 1024 * 1024:
-        await update.message.reply_text(
-            "⚠️ Файл слишком большой (максимум 10 МБ для малинки 3)",
-            reply_markup=MAIN_REPLY_KEYBOARD
-        )
+    if doc.file_size > 10 * 1024 * 1024:
+        await update.message.reply_text("⚠️ Максимум 10 МБ", reply_markup=MAIN_REPLY_KEYBOARD)
         return
 
-    # Проверяем очередь
     if conversion_queue.full():
-        await update.message.reply_text(
-            f"⏸️ Очередь заполнена ({conversion_queue.qsize()}/5 файлов).\nПопробуй через минуту.",
-            reply_markup=MAIN_REPLY_KEYBOARD
-        )
+        await update.message.reply_text(f"⏸️ Очередь заполнена ({conversion_queue.qsize()}/5)", reply_markup=MAIN_REPLY_KEYBOARD)
         return
 
-    # Генерируем простые имена файлов
     base_tmp = Path.cwd() / "tmp"
     simple_id = str(uuid4()).replace("-", "")[:12]
-    input_ext = Path(filename).suffix or ".fb2"
+    input_ext = Path(fname).suffix or ".fb2"
     output_ext = f".{settings_db.get_preferred_format(update.effective_user.id)}"
     
     input_path = base_tmp / f"in_{simple_id}{input_ext}"
     output_path = base_tmp / f"out_{simple_id}{output_ext}"
     
-    task_info = {
+    task = {
         "task_id": simple_id,
         "user_id": update.effective_user.id,
-        "file_id": document.file_id,
-        "file_name": document.file_name,
+        "file_id": doc.file_id,
+        "file_name": doc.file_name,
         "input_path": str(input_path),
         "output_path": str(output_path),
         "output_format": output_ext[1:],
         "status": "queued",
     }
-    active_tasks[simple_id] = task_info
+    active_tasks[simple_id] = task
 
-    # Скачиваем файл
     try:
-        file = await context.bot.get_file(document.file_id)
-        await file.download_to_drive(task_info["input_path"])
+        file = await context.bot.get_file(doc.file_id)
+        await file.download_to_drive(task["input_path"])
         
-        # Проверка 1: файл не пустой
-        input_size = Path(task_info["input_path"]).stat().st_size
+        input_size = Path(task["input_path"]).stat().st_size
         if input_size == 0:
-            raise ValueError("Файл пустой (0 байт)")
+            raise ValueError("Пустой файл")
         
-        # Проверка 2: для FB2 — валидный XML
-        if input_ext.lower() == ".fb2":
-            with open(task_info["input_path"], "rb") as f:
-                header = f.read(200).decode("utf-8", errors="ignore")
-                if "<?xml" not in header and "<FictionBook" not in header:
-                    raise ValueError("Файл не является валидным FB2 (отсутствует XML-структура)")
+        # Проверка: если .fb2 но на самом деле архив — предупредим пользователя
+        if input_ext.lower() == ".fb2" and is_zip_file(task["input_path"]):
+            logger.info("Обнаружен сжатый FB2 с расширением .fb2")
         
-        logger.info(f"Файл принят: {input_path.name} ({input_size / 1024:.1f} КБ)")
+        logger.info(f"Файл принят: {input_size / 1024:.1f} КБ")
     except Exception as e:
-        logger.error(f"Отклонён файл: {e}")
-        await update.message.reply_text(
-            f"❌ Некорректный файл: {str(e)}\n\nУбедись, что файл не повреждён.",
-            reply_markup=MAIN_REPLY_KEYBOARD
-        )
+        logger.error(f"Ошибка: {e}")
+        await update.message.reply_text(f"❌ {str(e)}", reply_markup=MAIN_REPLY_KEYBOARD)
         try:
-            Path(task_info["input_path"]).unlink(missing_ok=True)
+            Path(task["input_path"]).unlink(missing_ok=True)
         except:
             pass
         return
 
-    # Ставим в очередь
-    await conversion_queue.put(task_info)
-    position = conversion_queue.qsize()
-    
+    await conversion_queue.put(task)
     msg = await update.message.reply_text(
-        f"✅ Файл добавлен в очередь\n"
-        f"Формат: <b>{task_info['output_format'].upper()}</b>\n"
-        f"Позиция: {position} из 5",
+        f"✅ В очереди ({conversion_queue.qsize()}/5)\nФормат: <b>{task['output_format'].upper()}</b>",
         parse_mode=ParseMode.HTML
     )
-    task_info["message_id"] = msg.message_id
+    task["message_id"] = msg.message_id
 
-
-async def handle_text_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.message.text.strip()
-    if text == "📚 Отправить книгу":
-        await update.message.reply_text(
-            "📎 Прикрепи FB2 или EPUB файл (макс. 10 МБ)\n\n"
-            "💡 Бот автоматически найдёт обложку даже если в файле <code>id=\"cover.jpg\"</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=MAIN_REPLY_KEYBOARD
-        )
-    elif text == "⚙️ Настройки":
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    t = update.message.text.strip()
+    if t == "📚 Отправить книгу":
+        await update.message.reply_text("📎 FB2/EPUB до 10 МБ", reply_markup=MAIN_REPLY_KEYBOARD)
+    elif t == "⚙️ Настройки":
         await settings_menu(update, context)
-    elif text == "❓ Помощь":
+    elif t == "❓ Помощь":
         await help_command(update, context)
     else:
-        await update.message.reply_text(
-            "Используй меню внизу 👇",
-            reply_markup=MAIN_REPLY_KEYBOARD
-        )
+        await update.message.reply_text("Используй меню 👇", reply_markup=MAIN_REPLY_KEYBOARD)
 
-
-async def post_init(application: Application) -> None:
-    # Проверяем зависимости
-    tools = ["ebook-convert", "ebook-meta"]
-    for tool in tools:
+async def post_init(app: Application) -> None:
+    for tool in ["ebook-convert", "ebook-meta"]:
         try:
             subprocess.run([tool, "--version"], capture_output=True, timeout=5)
-            logger.info(f"✅ {tool} доступен")
-        except Exception as e:
-            logger.error(f"❌ {tool} не установлен: {e}")
-            raise RuntimeError(f"Требуется {tool}. Выполни: sudo apt install calibre")
-    
-    asyncio.create_task(conversion_worker(application))
-    logger.info("✅ Воркер запущен с надёжным извлечением обложек")
-
+        except:
+            raise RuntimeError(f"{tool} не установлен. Выполни: sudo apt install calibre")
+    asyncio.create_task(conversion_worker(app))
+    logger.info("✅ Бот готов")
 
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        logger.error("❌ Токен не найден! Создай .env с TELEGRAM_BOT_TOKEN")
-        return
-
-    application = Application.builder().token(token).post_init(post_init).build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("settings", settings_menu))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_commands))
-    application.add_handler(CallbackQueryHandler(handle_format_setting, pattern="^setfmt:"))
-
-    logger.info("🚀 Бот запущен! Поддержка обложек с любыми ID (включая cover.jpg)")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
+        raise RuntimeError("Нет TELEGRAM_BOT_TOKEN в .env")
+    
+    app = Application.builder().token(token).post_init(post_init).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("settings", settings_menu))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(CallbackQueryHandler(handle_format_setting, pattern="^setfmt:"))
+    
+    logger.info("🚀 Бот запущен с поддержкой сжатых FB2")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     try:

@@ -3,6 +3,7 @@ import logging
 import os
 import subprocess
 import re
+import shutil
 from pathlib import Path
 from uuid import uuid4
 from datetime import datetime
@@ -56,79 +57,131 @@ MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
 def extract_metadata(input_path: str) -> dict:
     """Извлекает автора и название книги через ebook-meta"""
     try:
+        if not Path(input_path).exists():
+            logger.error(f"Файл не найден для извлечения метаданных: {input_path}")
+            return {"title": "Неизвестно", "authors": ["Неизвестен"]}
+        
+        logger.info(f"Извлечение метаданных из: {input_path}")
         result = subprocess.run(
             ["ebook-meta", input_path],
             capture_output=True,
             text=True,
             timeout=30,
-            encoding='utf-8'
+            encoding='utf-8',
+            errors='replace'
         )
         
         if result.returncode != 0:
-            logger.warning(f"ebook-meta вернул ошибку: {result.stderr}")
-            return {"title": "Неизвестно", "authors": ["Неизвестен"]}
+            logger.warning(f"ebook-meta ошибка (код {result.returncode}):\n{result.stderr}")
+            # Пытаемся извлечь хоть что-то из вывода
+            title = "Неизвестно"
+            authors = ["Неизвестен"]
+            for line in result.stdout.splitlines():
+                if line.startswith("Title:") and len(line) > 6:
+                    title = line[6:].strip() or "Неизвестно"
+                elif line.startswith("Author(s):") and len(line) > 10:
+                    authors_raw = line[10:].strip()
+                    authors = [a.strip() for a in authors_raw.split(",")] if authors_raw else ["Неизвестен"]
+            return {"title": title, "authors": authors}
         
         # Парсим вывод
         metadata = {"title": "Неизвестно", "authors": ["Неизвестен"]}
-        lines = result.stdout.splitlines()
-        
-        for line in lines:
+        for line in result.stdout.splitlines():
             line = line.strip()
             if line.startswith("Title:") and len(line) > 6:
                 metadata["title"] = line[6:].strip() or "Неизвестно"
             elif line.startswith("Author(s):") and len(line) > 10:
-                authors = line[10:].strip()
-                metadata["authors"] = [a.strip() for a in authors.split(",")] if authors else ["Неизвестен"]
+                authors_raw = line[10:].strip()
+                metadata["authors"] = [a.strip() for a in authors_raw.split(",")] if authors_raw else ["Неизвестен"]
         
         logger.info(f"Метаданные извлечены: {metadata}")
         return metadata
         
+    except subprocess.TimeoutExpired:
+        logger.error("Таймаут при извлечении метаданных")
+        return {"title": "Неизвестно", "authors": ["Неизвестен"]}
     except Exception as e:
-        logger.warning(f"Ошибка извлечения метаданных: {e}")
+        logger.error(f"Ошибка извлечения метаданных: {e}", exc_info=True)
         return {"title": "Неизвестно", "authors": ["Неизвестен"]}
 
 
-def convert_book(input_path: str, output_path: str, output_format: str) -> bool:
-    """Конвертирует книгу БЕЗ проблемной опции --cover (автоизвлечение обложки)"""
+def convert_book(input_path: str, output_path: str, output_format: str) -> tuple[bool, str]:
+    """Конвертирует книгу. Возвращает (успех, диагностическое сообщение)"""
     try:
-        # Ключевое исправление: убрана опция --cover input_path
-        # ebook-convert сам извлекает обложку из FB2 если она есть в структуре файла
+        # Проверяем существование входного файла
+        input_p = Path(input_path)
+        if not input_p.exists():
+            return False, f"Входной файл не найден: {input_path}"
+        
+        if input_p.stat().st_size == 0:
+            return False, f"Входной файл пустой: {input_path} (0 байт)"
+        
+        logger.info(f"Начало конвертации: {input_path} → {output_path} ({output_format})")
+        logger.info(f"Размер входного файла: {input_p.stat().st_size / 1024:.1f} КБ")
+        
+        # Проверяем свободное место
+        free_space = shutil.disk_usage("/").free
+        if free_space < 50 * 1024 * 1024:  # 50 МБ
+            return False, f"Мало свободного места на диске: {free_space / 1024 / 1024:.1f} МБ"
+        
+        # Ключевое исправление: НЕТ опции --cover (она ломает конвертацию для FB2)
         cmd = [
             "ebook-convert",
-            input_path,
+            str(input_p),
             output_path,
             "--output-profile", "kindle_pw3",
-            "--preserve-cover-aspect-ratio",  # Сохраняем пропорции обложки
+            "--preserve-cover-aspect-ratio",
             "--margin-left", "0",
             "--margin-right", "0",
             "--margin-top", "0",
             "--margin-bottom", "0",
             "--extra-css", "body { font-family: serif; line-height: 1.4; }",
+            "--verbose",  # Детальный вывод для диагностики
         ]
         
-        # Для MOBI добавляем совместимость
         if output_format == "mobi":
-            cmd.extend([
-                "--mobi-keep-original-images",
-                "--mobi-toc-at-start"
-            ])
+            cmd.extend(["--mobi-keep-original-images", "--mobi-toc-at-start"])
         
-        logger.info(f"Запуск конвертации: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180, encoding='utf-8')
+        logger.debug(f"Команда конвертации: {' '.join(cmd)}")
+        
+        # Запускаем с таймаутом и перехватом вывода
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            encoding='utf-8',
+            errors='replace'
+        )
+        
+        output_p = Path(output_path)
         
         if result.returncode != 0:
-            logger.error(f"Ошибка конвертации (код {result.returncode}):\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}")
-            return False
+            error_msg = (
+                f"Код ошибки: {result.returncode}\n"
+                f"STDOUT (первые 500 символов):\n{result.stdout[:500]}\n"
+                f"STDERR (первые 500 символов):\n{result.stderr[:500]}"
+            )
+            logger.error(f"Ошибка конвертации:\n{error_msg}")
+            return False, error_msg
         
-        logger.info(f"Конвертация успешна: {output_path}")
-        return True
+        if not output_p.exists() or output_p.stat().st_size == 0:
+            error_msg = f"Выходной файл не создан или пустой. Размер: {output_p.stat().st_size if output_p.exists() else 'N/A'} байт"
+            logger.error(error_msg)
+            return False, error_msg
+        
+        logger.info(f"Конвертация успешна: {output_path} ({output_p.stat().st_size / 1024:.1f} КБ)")
+        return True, "OK"
         
     except subprocess.TimeoutExpired as e:
-        logger.error(f"Таймаут конвертации: {e}")
-        return False
+        logger.error(f"Таймаут конвертации (180 сек): {e}")
+        return False, "Таймаут конвертации (более 180 секунд)"
+    except MemoryError:
+        logger.error("Нехватка памяти при конвертации")
+        return False, "Нехватка оперативной памяти (малинка 3 имеет только 1 ГБ RAM)"
     except Exception as e:
         logger.error(f"Исключение при конвертации: {e}", exc_info=True)
-        return False
+        return False, f"Исключение: {type(e).__name__}: {str(e)[:200]}"
 
 
 async def conversion_worker(application: Application):
@@ -141,19 +194,19 @@ async def conversion_worker(application: Application):
             task_id = task["task_id"]
             active_tasks[task_id]["status"] = "converting"
             
-            # Извлекаем метаданные ДО конвертации
+            # Извлекаем метаданные
             metadata = extract_metadata(task["input_path"])
             title = metadata["title"]
             author = metadata["authors"][0] if metadata["authors"] else "Неизвестен"
             
-            # Обновляем статус с метаданными
+            # Обновляем статус
             await _update_status_message(
                 application, task_id,
                 f"⏳ Конвертирую:\n<b>{title}</b>\n<i>{author}</i>"
             )
             
-            # Конвертируем
-            success = convert_book(
+            # Конвертируем с диагностикой
+            success, diag_msg = convert_book(
                 task["input_path"],
                 task["output_path"],
                 task["output_format"]
@@ -161,14 +214,13 @@ async def conversion_worker(application: Application):
             
             # Отправляем результат
             if success and Path(task["output_path"]).exists():
-                # Формируем красивое имя файла
                 safe_title = re.sub(r'[<>:"/\\|?*]', '', title)[:50]
                 safe_author = re.sub(r'[<>:"/\\|?*]', '', author)[:30]
                 output_filename = f"{safe_author} - {safe_title}.{task['output_format']}"
                 
-                await _send_result(application, task, success=True, filename=output_filename)
+                await _send_result(application, task, success=True, filename=output_filename, title=title, author=author)
             else:
-                await _send_result(application, task, success=False, title=title, author=author)
+                await _send_result(application, task, success=False, title=title, author=author, diag_msg=diag_msg)
             
             # Чистим временные файлы
             _cleanup_temp_files(task["input_path"], task["output_path"])
@@ -201,7 +253,7 @@ async def _update_status_message(application: Application, task_id: str, status_
         logger.warning(f"Не удалось обновить статус: {e}")
 
 
-async def _send_result(application: Application, task: dict, success: bool, filename: str = None, title: str = None, author: str = None):
+async def _send_result(application: Application, task: dict, success: bool, filename: str = None, title: str = None, author: str = None, diag_msg: str = None):
     """Отправляет результат конвертации"""
     try:
         if success:
@@ -224,16 +276,18 @@ async def _send_result(application: Application, task: dict, success: bool, file
                 reply_markup=MAIN_REPLY_KEYBOARD
             )
         else:
+            error_text = (
+                f"❌ Ошибка конвертации книги:\n"
+                f"<b>{title or task['file_name']}</b>\n\n"
+                f"Диагностика:\n<code>{diag_msg[:300] if diag_msg else 'Неизвестная ошибка'}</code>\n\n"
+                f"💡 Советы:\n"
+                f"• Попробуй другой формат (EPUB вместо AZW3)\n"
+                f"• Убедись, что файл не повреждён\n"
+                f"• На малинке 3 конвертация больших книг (>5 МБ) может не уложиться в 1 ГБ RAM"
+            )
             await application.bot.send_message(
                 chat_id=task["user_id"],
-                text=(
-                    f"❌ Ошибка конвертации книги:\n"
-                    f"<b>{title or task['file_name']}</b>\n\n"
-                    f"Возможно:\n"
-                    f"• Повреждённый FB2\n"
-                    f"• Нестандартное форматирование\n"
-                    f"• Отсутствует обложка в структуре файла"
-                ),
+                text=error_text,
                 parse_mode=ParseMode.HTML,
                 reply_markup=MAIN_REPLY_KEYBOARD
             )
@@ -247,8 +301,9 @@ def _cleanup_temp_files(*paths):
         try:
             p = Path(path)
             if p.exists():
+                size_kb = p.stat().st_size / 1024
                 p.unlink()
-                logger.debug(f"Удалён временный файл: {path}")
+                logger.debug(f"Удалён временный файл: {path} ({size_kb:.1f} КБ)")
         except Exception as e:
             logger.warning(f"Не удалось удалить {path}: {e}")
 
@@ -281,7 +336,11 @@ def _get_help_text() -> str:
         "• Обложки и метаданные (автор/название) сохраняются автоматически\n"
         "• Файлы обрабатываются по очереди (макс. 5 одновременно)\n"
         "• Выходное имя файла: «Автор - Название.формат»\n\n"
-        "⚙️ Изменить формат по умолчанию: кнопка «⚙️ Настройки»"
+        "⚙️ Изменить формат по умолчанию: кнопка «⚙️ Настройки»\n\n"
+        "⚠️ <b>Важно для малинки 3:</b>\n"
+        "• Конвертация занимает 15–60 секунд\n"
+        "• Книги >5 МБ могут не конвертироваться из-за нехватки RAM (1 ГБ)\n"
+        "• При ошибке попробуй формат EPUB — он легче для системы"
     )
 
 
@@ -365,10 +424,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    # Ограничиваем размер
-    if document.file_size > 20 * 1024 * 1024:
+    # Ограничиваем размер (строже для малинки 3)
+    if document.file_size > 10 * 1024 * 1024:  # 10 МБ вместо 20
         await update.message.reply_text(
-            "⚠️ Файл слишком большой (максимум 20 МБ)",
+            "⚠️ Файл слишком большой (максимум 10 МБ для малинки 3).\n"
+            "Kindle и так не любит тяжёлые книги 😉",
             reply_markup=MAIN_REPLY_KEYBOARD
         )
         return
@@ -408,7 +468,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     try:
         file = await context.bot.get_file(document.file_id)
         await file.download_to_drive(task_info["input_path"])
-        logger.info(f"Файл скачан: {task_info['input_path']} ({Path(task_info['input_path']).stat().st_size} байт)")
+        input_size = Path(task_info["input_path"]).stat().st_size
+        logger.info(f"Файл скачан: {task_info['input_path']} ({input_size / 1024:.1f} КБ)")
+        
+        if input_size == 0:
+            raise ValueError("Скачанный файл пустой")
+            
     except Exception as e:
         logger.error(f"Ошибка скачивания: {e}")
         await update.message.reply_text(
@@ -437,7 +502,7 @@ async def handle_text_commands(update: Update, context: ContextTypes.DEFAULT_TYP
     
     if text == "📚 Отправить книгу":
         await update.message.reply_text(
-            "📎 Прикрепи FB2 или EPUB файл (макс. 20 МБ)",
+            "📎 Прикрепи FB2 или EPUB файл (макс. 10 МБ)",
             reply_markup=MAIN_REPLY_KEYBOARD
         )
     elif text == "⚙️ Настройки":
@@ -453,6 +518,15 @@ async def handle_text_commands(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def post_init(application: Application) -> None:
     """Запуск воркера после старта бота"""
+    # Проверяем зависимости при старте
+    for tool in ["ebook-convert", "ebook-meta"]:
+        try:
+            subprocess.run([tool, "--version"], capture_output=True, timeout=5)
+            logger.info(f"✅ {tool} доступен")
+        except Exception as e:
+            logger.error(f"❌ {tool} не установлен: {e}")
+            raise RuntimeError(f"Требуется {tool}. Установи: sudo apt install calibre")
+    
     asyncio.create_task(conversion_worker(application))
     logger.info("✅ Воркер конвертации запущен")
 
@@ -464,15 +538,6 @@ def main() -> None:
         logger.error("❌ Токен не найден! Создай .env с TELEGRAM_BOT_TOKEN")
         return
 
-    # Проверяем зависимости Calibre
-    for tool in ["ebook-convert", "ebook-meta"]:
-        try:
-            subprocess.run([tool, "--version"], capture_output=True, timeout=5)
-        except Exception as e:
-            logger.error(f"❌ {tool} не установлен: {e}")
-            logger.error("Установи: sudo apt install calibre")
-            return
-
     application = Application.builder().token(token).post_init(post_init).build()
 
     # Регистрируем обработчики
@@ -483,7 +548,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_commands))
     application.add_handler(CallbackQueryHandler(handle_format_setting, pattern="^setfmt:"))
 
-    logger.info("✅ Бот запущен с исправленной конвертацией и постоянным меню!")
+    logger.info("✅ Бот запущен с расширенной диагностикой!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

@@ -22,7 +22,7 @@ from telegram.ext import (
 )
 from storage import UserSettings
 
-# Проверяем наличие Pillow при старте
+# Проверяем наличие Pillow
 try:
     from PIL import Image
     HAS_PILLOW = True
@@ -57,7 +57,6 @@ MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
     one_time_keyboard=False
 )
 
-# Минимальные размеры обложки для Kindle
 MIN_COVER_WIDTH = 330
 MIN_COVER_HEIGHT = 500
 
@@ -72,11 +71,19 @@ def is_zip_file(path: str) -> bool:
 
 
 def unpack_if_needed(input_path: str) -> str:
-    """Распаковывает FB2.ZIP в чистый FB2"""
+    """Распаковывает FB2.ZIP в чистый FB2 с проверкой целостности"""
     input_p = Path(input_path)
     
     if not is_zip_file(input_path):
         logger.info(f"Файл не является архивом: {input_path}")
+        # Проверяем, что это валидный XML
+        try:
+            with open(input_path, "rb") as f:
+                header = f.read(200)
+                if b"<?xml" not in header and b"<FictionBook" not in header:
+                    logger.warning("Файл не содержит валидной структуры FB2")
+        except Exception as e:
+            logger.warning(f"Ошибка проверки FB2: {e}")
         return input_path
     
     logger.info(f"Распаковка архива: {input_path}")
@@ -90,7 +97,15 @@ def unpack_if_needed(input_path: str) -> str:
             with zf.open(fb2_files[0]) as src, open(extracted_path, "wb") as dst:
                 dst.write(src.read())
             
-            logger.info(f"Распаковано: {extracted_path}")
+            # 🔑 КРИТИЧЕСКАЯ ПРОВЕРКА: распакованный файл должен быть валидным XML
+            with open(extracted_path, "rb") as f:
+                header = f.read(200)
+                if b"<?xml" not in header and b"<FictionBook" not in header:
+                    logger.error("Распакованный файл не является валидным FB2 (битый архив?)")
+                    extracted_path.unlink(missing_ok=True)
+                    raise ValueError("Распакованный файл повреждён или не является FB2")
+            
+            logger.info(f"Распаковано успешно: {extracted_path}")
             return str(extracted_path)
     except Exception as e:
         logger.error(f"Ошибка распаковки: {e}")
@@ -98,9 +113,9 @@ def unpack_if_needed(input_path: str) -> str:
 
 
 def resize_cover_if_needed(cover_path: str) -> bool:
-    """Масштабирует обложку до минимальных размеров для Kindle (330×500)"""
+    """Масштабирует обложку до минимальных размеров для Kindle"""
     if not HAS_PILLOW:
-        logger.warning("Pillow не установлен — пропускаем масштабирование обложки")
+        logger.warning("Pillow не установлен — пропускаем масштабирование")
         return False
     
     try:
@@ -108,28 +123,21 @@ def resize_cover_if_needed(cover_path: str) -> bool:
         if not cover_p.exists() or cover_p.stat().st_size == 0:
             return False
         
-        # Открываем изображение
         with Image.open(cover_path) as img:
-            # Конвертируем в RGB если нужно (для JPEG)
             if img.mode in ("RGBA", "P"):
                 img = img.convert("RGB")
             
             width, height = img.size
-            needs_resize = width < MIN_COVER_WIDTH or height < MIN_COVER_HEIGHT
-            
-            if not needs_resize:
-                logger.info(f"Обложка уже достаточного размера: {width}×{height}")
+            if width >= MIN_COVER_WIDTH and height >= MIN_COVER_HEIGHT:
+                logger.info(f"Обложка достаточно большая: {width}×{height}")
                 return True
             
-            # Масштабируем с сохранением пропорций (метод LANCZOS для качества)
             ratio = max(MIN_COVER_WIDTH / width, MIN_COVER_HEIGHT / height)
             new_width = int(width * ratio)
             new_height = int(height * ratio)
             
-            logger.info(f"Масштабирование обложки: {width}×{height} → {new_width}×{new_height}")
+            logger.info(f"Масштабирование: {width}×{height} → {new_width}×{new_height}")
             img_resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            
-            # Сохраняем как JPEG с качеством 90%
             img_resized.save(cover_path, "JPEG", quality=90, optimize=True)
             
             new_size = cover_p.stat().st_size
@@ -137,7 +145,7 @@ def resize_cover_if_needed(cover_path: str) -> bool:
             return True
             
     except Exception as e:
-        logger.warning(f"Ошибка масштабирования обложки: {e}")
+        logger.warning(f"Ошибка масштабирования: {e}")
         return False
 
 
@@ -147,7 +155,6 @@ def extract_metadata_fallback(input_path: str) -> dict:
         with open(input_path, "rb") as f:
             content = f.read()
         
-        # Декодируем с разными кодировками
         for enc in ["utf-8", "cp1251", "koi8-r"]:
             try:
                 text = content.decode(enc)
@@ -157,7 +164,6 @@ def extract_metadata_fallback(input_path: str) -> dict:
         else:
             text = content.decode("utf-8", errors="ignore")
         
-        # Ищем автора
         author = "Неизвестен"
         first = re.search(r"<first-name[^>]*>([^<]+)</first-name>", text, re.IGNORECASE)
         last = re.search(r"<last-name[^>]*>([^<]+)</last-name>", text, re.IGNORECASE)
@@ -168,7 +174,6 @@ def extract_metadata_fallback(input_path: str) -> dict:
         elif last:
             author = last.group(1).strip()
         
-        # Ищем название
         title = "Без названия"
         title_match = re.search(r"<book-title[^>]*>([^<]+)</book-title>", text, re.IGNORECASE)
         if title_match:
@@ -224,7 +229,6 @@ def extract_metadata(input_path: str) -> dict:
 def extract_cover(input_path: str, cover_path: str) -> bool:
     """Извлекает обложку — сначала стандартно, потом ручной парсинг"""
     try:
-        # Шаг 1: стандартный способ
         try:
             subprocess.run(
                 ["ebook-meta", "--get-cover", input_path, cover_path],
@@ -234,19 +238,16 @@ def extract_cover(input_path: str, cover_path: str) -> bool:
             cover_p = Path(cover_path)
             if cover_p.exists() and cover_p.stat().st_size > 500:
                 logger.info(f"✅ Обложка извлечена стандартным способом ({cover_p.stat().st_size} байт)")
-                # Масштабируем если нужно
                 resize_cover_if_needed(cover_path)
                 return True
         except:
             pass
         
-        # Шаг 2: ручной парсинг
         logger.info("🔍 Ручной парсинг обложки...")
         try:
             with open(input_path, "rb") as f:
                 content = f.read()
             
-            # Ищем ЛЮБОЙ <binary> с изображением
             pattern = rb'<binary[^>]+content-type="image/[^"]+"[^>]*>([^<]+)</binary>'
             matches = re.findall(pattern, content)
             
@@ -254,7 +255,6 @@ def extract_cover(input_path: str, cover_path: str) -> bool:
                 logger.info("❌ Обложка не найдена: нет <binary> с изображением")
                 return False
             
-            # Декодируем первое изображение
             try:
                 image_data = base64.b64decode(matches[0].strip(), validate=True)
             except:
@@ -270,7 +270,6 @@ def extract_cover(input_path: str, cover_path: str) -> bool:
             cover_p = Path(cover_path)
             if cover_p.exists() and cover_p.stat().st_size > 500:
                 logger.info(f"✅ Обложка извлечена ручным парсингом ({cover_p.stat().st_size} байт)")
-                # Масштабируем если нужно
                 resize_cover_if_needed(cover_path)
                 return True
                 
@@ -284,28 +283,41 @@ def extract_cover(input_path: str, cover_path: str) -> bool:
 
 
 def convert_book(input_path: str, output_path: str, cover_path: str = None) -> tuple[bool, str]:
-    """Конвертация с опциями для корректного отображения обложки в библиотеке Kindle"""
+    """Конвертация с детальной диагностикой ошибок"""
     try:
         input_abs = str(Path(input_path).resolve())
         output_abs = str(Path(output_path).resolve())
         cover_abs = str(Path(cover_path).resolve()) if cover_path else None
         
-        # Определяем формат вывода
+        # 🔑 КРИТИЧЕСКАЯ ПРОВЕРКА: существует ли входной файл и не пустой ли он
+        input_p = Path(input_abs)
+        if not input_p.exists():
+            return False, f"Входной файл не найден: {input_abs}"
+        if input_p.stat().st_size == 0:
+            return False, f"Входной файл пустой: {input_abs} ({input_p.stat().st_size} байт)"
+        
+        # Проверяем структуру файла (должен быть XML для FB2)
+        try:
+            with open(input_abs, "rb") as f:
+                header = f.read(200)
+                if b"<?xml" not in header and b"<FictionBook" not in header:
+                    logger.warning("Входной файл не содержит валидной структуры FB2")
+        except Exception as e:
+            logger.warning(f"Ошибка проверки структуры: {e}")
+        
         output_ext = Path(output_path).suffix.lower()
         is_kindle_format = output_ext in (".azw3", ".mobi")
         
         cmd = ["ebook-convert", input_abs, output_abs]
         
-        # Добавляем обложку ЕСЛИ найдена
         if cover_abs and Path(cover_abs).exists():
             cover_size = Path(cover_abs).stat().st_size
             if cover_size > 500:
                 cmd.extend(["--cover", cover_abs])
-                logger.info(f"✅ Используем обложку ({cover_size} байт) для метаданных книги")
+                logger.info(f"✅ Используем обложку ({cover_size} байт)")
             else:
-                logger.warning(f"⚠️ Обложка слишком маленькая даже после масштабирования ({cover_size} байт)")
+                logger.warning(f"⚠️ Обложка слишком маленькая ({cover_size} байт)")
         
-        # КРИТИЧЕСКИ ВАЖНЫЕ опции для отображения обложки в библиотеке
         if is_kindle_format:
             cmd.extend([
                 "--output-profile", "kindle_pw3",
@@ -314,15 +326,16 @@ def convert_book(input_path: str, output_path: str, cover_path: str = None) -> t
                 "--mobi-keep-original-images",
                 "--cover-margin", "0",
             ])
-        else:  # EPUB
+        else:
             cmd.extend([
                 "--output-profile", "tablet",
                 "--pretty-print",
             ])
         
         logger.info(f"Конвертация: {Path(input_abs).name} → {Path(output_abs).name}")
-        logger.debug(f"Команда: {' '.join(cmd)}")
+        logger.debug(f"Полная команда: {' '.join(cmd)}")
         
+        # 🔑 ЗАПУСК С ДЕТАЛЬНЫМ ВЫВОДОМ ОШИБОК
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -334,14 +347,20 @@ def convert_book(input_path: str, output_path: str, cover_path: str = None) -> t
         
         output_p = Path(output_abs)
         if result.returncode != 0:
-            logger.error(f"STDERR: {result.stderr[:500]}")
-            return False, f"Код {result.returncode}"
+            # 🔑 ДЕТАЛЬНАЯ ДИАГНОСТИКА
+            error_msg = f"Код {result.returncode}\n"
+            if result.stderr:
+                error_msg += f"STDERR (первые 800 символов):\n{result.stderr[:800]}"
+            else:
+                error_msg += "STDERR пустой — возможно, проблема с путями или правами"
+            logger.error(f"Ошибка конвертации:\n{error_msg}")
+            return False, error_msg[:500]  # Обрезаем для отправки в телеграм
         
         if not output_p.exists() or output_p.stat().st_size == 0:
-            return False, "Файл не создан"
+            return False, f"Выходной файл не создан ({output_p.stat().st_size if output_p.exists() else 'N/A'} байт)"
         
-        # Проверяем, появилась ли обложка в метаданных результата
-        has_cover_in_result = False
+        # Проверяем обложку в результате
+        has_cover = False
         try:
             meta_result = subprocess.run(
                 ["ebook-meta", str(output_p)],
@@ -351,19 +370,19 @@ def convert_book(input_path: str, output_path: str, cover_path: str = None) -> t
                 encoding='utf-8',
                 errors='replace'
             )
-            has_cover_in_result = "cover" in meta_result.stdout.lower()
+            has_cover = "cover" in meta_result.stdout.lower()
         except:
             pass
         
         size_info = f"{output_p.stat().st_size / 1024:.1f} КБ"
-        cover_info = " ✓ обложка в библиотеке" if has_cover_in_result else " ✗ без миниатюры"
+        cover_info = " ✓ обложка в библиотеке" if has_cover else " ✗ без миниатюры"
         return True, f"{size_info}{cover_info}"
         
     except subprocess.TimeoutExpired:
         return False, "Таймаут 180 сек"
     except Exception as e:
         logger.error(f"Исключение в конвертации: {e}", exc_info=True)
-        return False, f"{type(e).__name__}: {str(e)[:150]}"
+        return False, f"{type(e).__name__}: {str(e)[:200]}"
 
 
 async def conversion_worker(application: Application):
@@ -375,20 +394,22 @@ async def conversion_worker(application: Application):
             task_id = task["task_id"]
             active_tasks[task_id]["status"] = "converting"
             
-            # Распаковываем если нужно
             unpacked_path = unpack_if_needed(task["input_path"])
             cleanup_unpacked = (unpacked_path != task["input_path"])
             
-            # Извлекаем метаданные
+            # 🔑 ДОП. ПРОВЕРКА: существует ли распакованный файл
+            if not Path(unpacked_path).exists():
+                raise FileNotFoundError(f"Распакованный файл не найден: {unpacked_path}")
+            if Path(unpacked_path).stat().st_size == 0:
+                raise ValueError(f"Распакованный файл пустой: {unpacked_path}")
+            
             metadata = extract_metadata(unpacked_path)
             title = metadata["title"] or "Без названия"
             author = metadata["authors"][0] if metadata["authors"] else "Неизвестен"
             
-            # Извлекаем обложку
             cover_path = f"{task['input_path']}.cover.jpg"
             has_cover = extract_cover(unpacked_path, cover_path)
             
-            # Обновляем статус
             try:
                 status = f"⏳ Конвертирую:\n<b>{title}</b>\n<i>{author}</i>"
                 if has_cover:
@@ -404,14 +425,12 @@ async def conversion_worker(application: Application):
             except:
                 pass
             
-            # Конвертируем
             success, diag = convert_book(
                 unpacked_path,
                 task["output_path"],
                 cover_path if has_cover else None
             )
             
-            # Отправляем результат
             output_p = Path(task["output_path"])
             if success and output_p.exists():
                 safe_title = re.sub(r'[<>:"/\\|?*]', '', title)[:50]
@@ -440,14 +459,26 @@ async def conversion_worker(application: Application):
                     reply_markup=MAIN_REPLY_KEYBOARD
                 )
             else:
+                # 🔑 ОТПРАВКА ДЕТАЛЬНОЙ ДИАГНОСТИКИ
+                error_text = (
+                    f"❌ Ошибка конвертации <b>{title}</b>:\n"
+                    f"<code>{diag}</code>\n\n"
+                    f"💡 Возможные причины:\n"
+                    f"• Повреждённый архив FB2\n"
+                    f"• Некорректная структура файла\n"
+                    f"• Проблема с путями (слишком длинные имена)\n\n"
+                    f"Попробуй:\n"
+                    f"1. Распаковать файл вручную через Calibre на ПК\n"
+                    f"2. Сохранить как чистый FB2 (без архивации)\n"
+                    f"3. Отправить заново"
+                )
                 await application.bot.send_message(
                     chat_id=task["user_id"],
-                    text=f"❌ Ошибка <b>{title}</b>:\n<code>{diag}</code>",
+                    text=error_text,
                     parse_mode=ParseMode.HTML,
                     reply_markup=MAIN_REPLY_KEYBOARD
                 )
             
-            # Чистим файлы
             for p in [task["input_path"], task["output_path"], cover_path]:
                 try:
                     fp = Path(p)
@@ -466,6 +497,16 @@ async def conversion_worker(application: Application):
             
         except Exception as e:
             logger.error(f"Ошибка воркера: {e}", exc_info=True)
+            error_msg = f"❌ Критическая ошибка: {type(e).__name__}\n<code>{str(e)[:300]}</code>"
+            try:
+                await application.bot.send_message(
+                    chat_id=task["user_id"],
+                    text=error_msg,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=MAIN_REPLY_KEYBOARD
+                )
+            except:
+                pass
             await asyncio.sleep(5)
 
 
@@ -474,10 +515,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📚 <b>KindleGarden Bot</b>\n\n"
         "Отправляй FB2/EPUB → получаешь книгу для Kindle!\n\n"
         "✨ Особенности:\n"
-        "• Автоматическое извлечение обложки даже из «кривых» FB2\n"
-        "• Масштабирование маленьких обложек до размеров Kindle (330×500)\n"
-        "• Корректное отображение миниатюры в библиотеке устройства\n"
+        "• Автоматическое извлечение и масштабирование обложек (330×500)\n"
         "• Поддержка сжатых файлов (.fb2.zip)\n"
+        "• Корректное отображение миниатюры в библиотеке Kindle\n"
         "• Очередь обработки (макс. 5 файлов)"
     )
     await update.message.reply_text(
@@ -489,16 +529,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = (
-        "📚 <b>Как работает бот:</b>\n\n"
-        "1️⃣ <b>Обложки:</b>\n"
-        "   • Извлекает из любого FB2 (даже с ошибками в структуре)\n"
-        "   • Автоматически масштабирует маленькие обложки до 330×500 пикселей\n"
-        "   • Гарантирует отображение миниатюры в библиотеке Kindle\n\n"
-        "2️⃣ <b>Сжатые файлы:</b>\n"
-        "   • Поддерживает .fb2 и .fb2.zip (даже если названы просто .fb2)\n\n"
-        "3️⃣ <b>Метаданные:</b>\n"
-        "   • Извлекает автора и название даже если они не распознаны Calibre\n\n"
-        "💡 <b>Совет:</b> Для лучшего качества обложки используй файлы с изображением не меньше 600×900 пикселей."
+        "📚 <b>Инструкция:</b>\n\n"
+        "✅ <b>Работает стабильно:</b>\n"
+        "• Чистые FB2 (.fb2)\n"
+        "• EPUB\n\n"
+        "⚠️ <b>Требует подготовки:</b>\n"
+        "• Сжатые FB2 (.fb2.zip) — бот распаковывает автоматически,\n"
+        "  но некоторые архивы могут быть повреждены.\n"
+        "  Если ошибка — распакуй файл вручную через Calibre на ПК\n"
+        "  и отправь чистый .fb2.\n\n"
+        "💡 <b>Совет:</b> Для 100% гарантии конвертации:\n"
+        "1. Открой файл в Calibre (на ПК)\n"
+        "2. ПКМ → «Сохранить на диск»\n"
+        "3. Отправь полученный файл в бота"
     )
     await update.message.reply_text(
         message,
@@ -540,7 +583,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     document = update.message.document
     filename = document.file_name.lower() if document.file_name else ""
     
-    # Проверяем формат
     if not (filename.endswith(".fb2") or filename.endswith(".fb2.zip") or filename.endswith(".epub")):
         await update.message.reply_text(
             "⚠️ Принимаю только FB2 и EPUB файлы (.fb2, .fb2.zip, .epub)",
@@ -548,7 +590,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    # Лимит размера для малинки 3
     if document.file_size > 10 * 1024 * 1024:
         await update.message.reply_text(
             "⚠️ Файл слишком большой (максимум 10 МБ для малинки 3)",
@@ -556,7 +597,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    # Проверяем очередь
     if conversion_queue.full():
         await update.message.reply_text(
             f"⏸️ Очередь заполнена ({conversion_queue.qsize()}/5 файлов).\nПопробуй через минуту.",
@@ -564,7 +604,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    # Генерируем простые имена файлов
     base_tmp = Path.cwd() / "tmp"
     simple_id = str(uuid4()).replace("-", "")[:12]
     input_ext = Path(filename).suffix or ".fb2"
@@ -585,21 +624,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     }
     active_tasks[simple_id] = task_info
 
-    # Скачиваем файл
     try:
         file = await context.bot.get_file(document.file_id)
         await file.download_to_drive(task_info["input_path"])
         
-        # Проверка 1: файл не пустой
         input_size = Path(task_info["input_path"]).stat().st_size
         if input_size == 0:
             raise ValueError("Файл пустой (0 байт)")
         
-        # Проверка 2: для FB2 — валидный XML (или архив)
+        # Проверка структуры для FB2
         if input_ext.lower() == ".fb2":
             with open(task_info["input_path"], "rb") as f:
                 header = f.read(200)
-                # Проверяем: либо XML, либо ZIP
                 is_xml = b"<?xml" in header or b"<FictionBook" in header
                 is_zip = header.startswith(b"PK\x03\x04")
                 if not (is_xml or is_zip):
@@ -618,7 +654,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             pass
         return
 
-    # Ставим в очередь
     await conversion_queue.put(task_info)
     position = conversion_queue.qsize()
     
@@ -636,7 +671,7 @@ async def handle_text_commands(update: Update, context: ContextTypes.DEFAULT_TYP
     if text == "📚 Отправить книгу":
         await update.message.reply_text(
             "📎 Прикрепи FB2 или EPUB файл (макс. 10 МБ)\n\n"
-            "💡 Бот автоматически найдёт и при необходимости масштабирует обложку!",
+            "💡 Бот автоматически обработает обложку и метаданные",
             reply_markup=MAIN_REPLY_KEYBOARD
         )
     elif text == "⚙️ Настройки":
@@ -651,7 +686,6 @@ async def handle_text_commands(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def post_init(application: Application) -> None:
-    # Проверяем зависимости
     tools = ["ebook-convert", "ebook-meta"]
     for tool in tools:
         try:
@@ -663,10 +697,9 @@ async def post_init(application: Application) -> None:
     
     if not HAS_PILLOW:
         logger.warning("⚠️  Pillow не установлен — обложки не будут масштабироваться")
-        logger.warning("   Выполни: pip install Pillow")
     
     asyncio.create_task(conversion_worker(application))
-    logger.info("✅ Воркер запущен с поддержкой масштабирования обложек")
+    logger.info("✅ Воркер запущен с расширенной диагностикой")
 
 
 def main() -> None:
@@ -684,7 +717,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_commands))
     application.add_handler(CallbackQueryHandler(handle_format_setting, pattern="^setfmt:"))
 
-    logger.info("🚀 Бот запущен! Обложки масштабируются до 330×500 пикселей для Kindle")
+    logger.info("🚀 Бот запущен с защитой от битых архивов и детальной диагностикой")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

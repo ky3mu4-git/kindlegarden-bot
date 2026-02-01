@@ -7,7 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 from datetime import datetime
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -43,6 +43,13 @@ conversion_queue = asyncio.Queue(maxsize=5)
 active_tasks = {}
 settings_db = UserSettings()
 
+# Постоянное меню внизу экрана
+MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
+    [["📚 Отправить книгу", "⚙️ Настройки", "❓ Помощь"]],
+    resize_keyboard=True,
+    one_time_keyboard=False
+)
+
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
@@ -53,25 +60,26 @@ def extract_metadata(input_path: str) -> dict:
             ["ebook-meta", input_path],
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=30,
+            encoding='utf-8'
         )
         
         if result.returncode != 0:
             logger.warning(f"ebook-meta вернул ошибку: {result.stderr}")
             return {"title": "Неизвестно", "authors": ["Неизвестен"]}
         
-        # Парсим вывод (пример: "Title: Название книги")
+        # Парсим вывод
         metadata = {"title": "Неизвестно", "authors": ["Неизвестен"]}
         lines = result.stdout.splitlines()
         
         for line in lines:
-            if line.startswith("Title:"):
+            line = line.strip()
+            if line.startswith("Title:") and len(line) > 6:
                 metadata["title"] = line[6:].strip() or "Неизвестно"
-            elif line.startswith("Author(s):"):
+            elif line.startswith("Author(s):") and len(line) > 10:
                 authors = line[10:].strip()
                 metadata["authors"] = [a.strip() for a in authors.split(",")] if authors else ["Неизвестен"]
         
-        # Логируем для отладки
         logger.info(f"Метаданные извлечены: {metadata}")
         return metadata
         
@@ -81,22 +89,21 @@ def extract_metadata(input_path: str) -> dict:
 
 
 def convert_book(input_path: str, output_path: str, output_format: str) -> bool:
-    """Конвертирует книгу с сохранением обложки и метаданных"""
+    """Конвертирует книгу БЕЗ проблемной опции --cover (автоизвлечение обложки)"""
     try:
-        # Опции для максимального сохранения обложки и метаданных
+        # Ключевое исправление: убрана опция --cover input_path
+        # ebook-convert сам извлекает обложку из FB2 если она есть в структуре файла
         cmd = [
             "ebook-convert",
             input_path,
             output_path,
             "--output-profile", "kindle_pw3",
             "--preserve-cover-aspect-ratio",  # Сохраняем пропорции обложки
-            "--cover", input_path,             # Указываем исходник как источник обложки
             "--margin-left", "0",
             "--margin-right", "0",
             "--margin-top", "0",
             "--margin-bottom", "0",
             "--extra-css", "body { font-family: serif; line-height: 1.4; }",
-            "--embed-font-family", "Liberation Serif",  # Встраиваем шрифт для лучшей типографики
         ]
         
         # Для MOBI добавляем совместимость
@@ -107,17 +114,17 @@ def convert_book(input_path: str, output_path: str, output_format: str) -> bool:
             ])
         
         logger.info(f"Запуск конвертации: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180, encoding='utf-8')
         
         if result.returncode != 0:
-            logger.error(f"Ошибка конвертации (код {result.returncode}):\n{result.stderr}")
+            logger.error(f"Ошибка конвертации (код {result.returncode}):\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}")
             return False
         
         logger.info(f"Конвертация успешна: {output_path}")
         return True
         
-    except subprocess.TimeoutExpired:
-        logger.error("Таймаут конвертации (более 180 сек)")
+    except subprocess.TimeoutExpired as e:
+        logger.error(f"Таймаут конвертации: {e}")
         return False
     except Exception as e:
         logger.error(f"Исключение при конвертации: {e}", exc_info=True)
@@ -161,7 +168,7 @@ async def conversion_worker(application: Application):
                 
                 await _send_result(application, task, success=True, filename=output_filename)
             else:
-                await _send_result(application, task, success=False)
+                await _send_result(application, task, success=False, title=title, author=author)
             
             # Чистим временные файлы
             _cleanup_temp_files(task["input_path"], task["output_path"])
@@ -194,7 +201,7 @@ async def _update_status_message(application: Application, task_id: str, status_
         logger.warning(f"Не удалось обновить статус: {e}")
 
 
-async def _send_result(application: Application, task: dict, success: bool, filename: str = None):
+async def _send_result(application: Application, task: dict, success: bool, filename: str = None, title: str = None, author: str = None):
     """Отправляет результат конвертации"""
     try:
         if success:
@@ -205,22 +212,30 @@ async def _send_result(application: Application, task: dict, success: bool, file
                 filename=filename or f"{Path(task['file_name']).stem}.{task['output_format']}",
                 caption=(
                     f"✅ Готово! Сконвертировано в <b>{task['output_format'].upper()}</b>\n\n"
+                    f"📚 {title or 'Неизвестно'}\n"
+                    f"👤 {author or 'Неизвестен'}\n"
                     f"📦 {output_path.stat().st_size / 1024:.1f} КБ"
                 ),
                 parse_mode=ParseMode.HTML,
             )
             await application.bot.send_message(
                 chat_id=task["user_id"],
-                text="Файл готов к отправке на Kindle! 📚\n\nОтправь ещё один FB2/EPUB для конвертации."
+                text="Файл готов к отправке на Kindle! 📚\n\nОтправь ещё один FB2/EPUB для конвертации.",
+                reply_markup=MAIN_REPLY_KEYBOARD
             )
         else:
             await application.bot.send_message(
                 chat_id=task["user_id"],
                 text=(
-                    "❌ Ошибка конвертации файла <b>{}</b>.\n\n"
-                    "Возможно, повреждённый файл или нестандартное форматирование."
-                ).format(task["file_name"]),
+                    f"❌ Ошибка конвертации книги:\n"
+                    f"<b>{title or task['file_name']}</b>\n\n"
+                    f"Возможно:\n"
+                    f"• Повреждённый FB2\n"
+                    f"• Нестандартное форматирование\n"
+                    f"• Отсутствует обложка в структуре файла"
+                ),
                 parse_mode=ParseMode.HTML,
+                reply_markup=MAIN_REPLY_KEYBOARD
             )
     except Exception as e:
         logger.error(f"Ошибка отправки результата: {e}")
@@ -233,20 +248,13 @@ def _cleanup_temp_files(*paths):
             p = Path(path)
             if p.exists():
                 p.unlink()
+                logger.debug(f"Удалён временный файл: {path}")
         except Exception as e:
             logger.warning(f"Не удалось удалить {path}: {e}")
 
 
-def _get_main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Главное меню"""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚙️ Настройки", callback_data="menu:settings")],
-        [InlineKeyboardButton("❓ Помощь", callback_data="menu:help")],
-    ])
-
-
-def _get_format_selection_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    """Кнопки выбора формата в настройках"""
+def _get_inline_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Кнопки выбора формата в настройках (инлайн)"""
     current = settings_db.get_preferred_format(user_id)
     formats = [
         ("📘 AZW3 (рекомендуется)", "azw3"),
@@ -259,7 +267,6 @@ def _get_format_selection_keyboard(user_id: int) -> InlineKeyboardMarkup:
         prefix = "✅ " if fmt == current else ""
         buttons.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f"setfmt:{fmt}")])
     
-    buttons.append([InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu:main")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -267,21 +274,21 @@ def _get_help_text() -> str:
     """Текст помощи"""
     return (
         "📚 <b>Как пользоваться ботом:</b>\n\n"
-        "1. Отправь файл в формате FB2 или EPUB (макс. 20 МБ)\n"
+        "1. Нажми «📚 Отправить книгу» или просто прикрепи FB2/EPUB файл\n"
         "2. Бот автоматически конвертирует его в выбранный формат\n"
-        "3. Получи готовый файл для Kindle\n\n"
+        "3. Получи готовый файл для Kindle с обложкой и метаданными!\n\n"
         "✨ <b>Особенности:</b>\n"
-        "• Обложки и метаданные (автор/название) сохраняются\n"
+        "• Обложки и метаданные (автор/название) сохраняются автоматически\n"
         "• Файлы обрабатываются по очереди (макс. 5 одновременно)\n"
         "• Выходное имя файла: «Автор - Название.формат»\n\n"
-        "⚙️ Настроить формат по умолчанию: /settings"
+        "⚙️ Изменить формат по умолчанию: кнопка «⚙️ Настройки»"
     )
 
 
 # ========== ОБРАБОТЧИКИ ==========
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Главное меню"""
+    """Главное меню с постоянной клавиатурой"""
     message = (
         "📚 <b>KindleGarden Bot</b>\n\n"
         "Конвертирую FB2/EPUB → Kindle-форматы с сохранением обложек и метаданных!\n\n"
@@ -289,12 +296,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• <b>AZW3</b> — рекомендуется для современных Kindle\n"
         "• <b>EPUB</b> — универсальный формат (Kindle 2022+)\n"
         "• <b>MOBI</b> — для очень старых устройств\n\n"
-        "Просто отправь файл — и получи готовую книгу! 🚀"
+        "Просто отправь файл или нажми «📚 Отправить книгу» 👇"
     )
     await update.message.reply_text(
         message,
         parse_mode=ParseMode.HTML,
-        reply_markup=_get_main_menu_keyboard()
+        reply_markup=MAIN_REPLY_KEYBOARD
     )
 
 
@@ -303,7 +310,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(
         _get_help_text(),
         parse_mode=ParseMode.HTML,
-        reply_markup=_get_main_menu_keyboard()
+        reply_markup=MAIN_REPLY_KEYBOARD
     )
 
 
@@ -322,40 +329,8 @@ async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(
         message,
         parse_mode=ParseMode.HTML,
-        reply_markup=_get_format_selection_keyboard(user_id)
+        reply_markup=_get_inline_settings_keyboard(user_id)
     )
-
-
-async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик навигации по меню"""
-    query = update.callback_query
-    await query.answer()
-    
-    data = query.data
-    user_id = update.effective_user.id
-    
-    if data == "menu:main":
-        await query.edit_message_text(
-            "📚 <b>KindleGarden Bot</b>\n\nВыбери действие:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=_get_main_menu_keyboard()
-        )
-    elif data == "menu:settings":
-        current_format = settings_db.get_preferred_format(user_id)
-        format_names = {"azw3": "AZW3", "epub": "EPUB", "mobi": "MOBI"}
-        await query.edit_message_text(
-            f"⚙️ <b>Настройки</b>\n\nТекущий формат: <b>{format_names.get(current_format, current_format)}</b>\n\nВыбери новый формат:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=_get_format_selection_keyboard(user_id)
-        )
-    elif data == "menu:help":
-        await query.edit_message_text(
-            _get_help_text(),
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu:main")]
-            ])
-        )
 
 
 async def handle_format_setting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -371,11 +346,10 @@ async def handle_format_setting(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text(
         f"✅ Формат по умолчанию установлен: <b>{format_names.get(fmt, fmt)}</b>\n\n"
         "Теперь все файлы будут конвертироваться в этот формат автоматически.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu:main")]
-        ])
+        parse_mode=ParseMode.HTML
     )
+    # Возвращаем постоянное меню
+    await query.message.reply_text("Выбери действие:", reply_markup=MAIN_REPLY_KEYBOARD)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -386,14 +360,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     filename = document.file_name.lower() if document.file_name else ""
     if not (filename.endswith(".fb2") or filename.endswith(".fb2.zip") or filename.endswith(".epub")):
         await update.message.reply_text(
-            "⚠️ Принимаю только FB2 и EPUB файлы (.fb2, .fb2.zip, .epub)"
+            "⚠️ Принимаю только FB2 и EPUB файлы (.fb2, .fb2.zip, .epub)",
+            reply_markup=MAIN_REPLY_KEYBOARD
         )
         return
 
     # Ограничиваем размер
     if document.file_size > 20 * 1024 * 1024:
         await update.message.reply_text(
-            "⚠️ Файл слишком большой (максимум 20 МБ)"
+            "⚠️ Файл слишком большой (максимум 20 МБ)",
+            reply_markup=MAIN_REPLY_KEYBOARD
         )
         return
 
@@ -401,7 +377,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if conversion_queue.full():
         await update.message.reply_text(
             f"⏸️ Очередь заполнена ({conversion_queue.qsize()}/{conversion_queue.maxsize} файлов).\n"
-            "Попробуй через минуту."
+            "Попробуй через минуту.",
+            reply_markup=MAIN_REPLY_KEYBOARD
         )
         return
 
@@ -431,10 +408,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     try:
         file = await context.bot.get_file(document.file_id)
         await file.download_to_drive(task_info["input_path"])
-        logger.info(f"Файл скачан: {task_info['input_path']}")
+        logger.info(f"Файл скачан: {task_info['input_path']} ({Path(task_info['input_path']).stat().st_size} байт)")
     except Exception as e:
         logger.error(f"Ошибка скачивания: {e}")
-        await update.message.reply_text("❌ Ошибка при скачивании файла. Попробуй заново.")
+        await update.message.reply_text(
+            "❌ Ошибка при скачивании файла. Попробуй заново.",
+            reply_markup=MAIN_REPLY_KEYBOARD
+        )
         return
 
     # Ставим в очередь
@@ -443,12 +423,32 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     
     # Показываем статус
     msg = await update.message.reply_text(
-        f"✅ Файл <b>{document.file_name}</b> добавлен в очередь\n"
+        f"✅ Файл добавлен в очередь\n"
         f"Формат: <b>{output_format.upper()}</b>\n"
         f"Позиция: {position} из {conversion_queue.maxsize}",
         parse_mode=ParseMode.HTML
     )
     task_info["message_id"] = msg.message_id
+
+
+async def handle_text_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик текстовых кнопок меню"""
+    text = update.message.text.strip()
+    
+    if text == "📚 Отправить книгу":
+        await update.message.reply_text(
+            "📎 Прикрепи FB2 или EPUB файл (макс. 20 МБ)",
+            reply_markup=MAIN_REPLY_KEYBOARD
+        )
+    elif text == "⚙️ Настройки":
+        await settings_menu(update, context)
+    elif text == "❓ Помощь":
+        await help_command(update, context)
+    else:
+        await update.message.reply_text(
+            "Не понимаю эту команду. Используй меню внизу 👇",
+            reply_markup=MAIN_REPLY_KEYBOARD
+        )
 
 
 async def post_init(application: Application) -> None:
@@ -480,10 +480,10 @@ def main() -> None:
     application.add_handler(CommandHandler("settings", settings_menu))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    application.add_handler(CallbackQueryHandler(handle_menu_callback, pattern="^menu:"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_commands))
     application.add_handler(CallbackQueryHandler(handle_format_setting, pattern="^setfmt:"))
 
-    logger.info("✅ Бот запущен с умной очередью и сохранением обложек!")
+    logger.info("✅ Бот запущен с исправленной конвертацией и постоянным меню!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

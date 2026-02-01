@@ -46,12 +46,42 @@ MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 
+def extract_cover(input_path: str, cover_path: str) -> bool:
+    """Извлекает обложку из книги через ebook-meta"""
+    try:
+        if not Path(input_path).exists():
+            return False
+        
+        # Извлекаем обложку
+        result = subprocess.run(
+            ["ebook-meta", "--get-cover", input_path, cover_path],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            encoding='utf-8',
+            errors='replace'
+        )
+        
+        # ebook-meta возвращает 0 даже если обложки нет, поэтому проверяем файл
+        cover_p = Path(cover_path)
+        if cover_p.exists() and cover_p.stat().st_size > 1000:  # >1 КБ = реальная обложка
+            logger.info(f"Обложка извлечена: {cover_path} ({cover_p.stat().st_size} байт)")
+            return True
+        else:
+            logger.info("Обложка не найдена во входном файле")
+            return False
+            
+    except Exception as e:
+        logger.warning(f"Ошибка извлечения обложки: {e}")
+        return False
+
+
 def extract_metadata(input_path: str) -> dict:
     """Извлекает метаданные через ebook-meta"""
     try:
         input_p = Path(input_path)
         if not input_p.exists() or input_p.stat().st_size == 0:
-            return {"title": None, "authors": None, "has_cover": False}
+            return {"title": None, "authors": None}
         
         result = subprocess.run(
             ["ebook-meta", str(input_p)],
@@ -62,11 +92,7 @@ def extract_metadata(input_path: str) -> dict:
             errors='replace'
         )
         
-        metadata = {"title": None, "authors": None, "has_cover": False}
-        
-        # Проверяем обложку
-        if "cover" in result.stdout.lower() or "Cover image" in result.stdout or "Cover:" in result.stdout:
-            metadata["has_cover"] = True
+        metadata = {"title": None, "authors": None}
         
         # Извлекаем автора и название
         for line in result.stdout.splitlines():
@@ -87,28 +113,34 @@ def extract_metadata(input_path: str) -> dict:
             clean = re.sub(r'[._-]+', ' ', clean)
             metadata["title"] = clean.strip() or "Без названия"
         
-        logger.info(f"Метаданные: title={metadata['title']}, authors={metadata['authors']}, cover={metadata['has_cover']}")
+        logger.info(f"Метаданные: title={metadata['title']}, authors={metadata['authors']}")
         return metadata
         
     except Exception as e:
         logger.warning(f"Ошибка извлечения метаданных: {e}")
-        return {"title": "Без названия", "authors": None, "has_cover": False}
+        return {"title": "Без названия", "authors": None}
 
 
-def convert_book(input_path: str, output_path: str) -> tuple[bool, str]:
-    """МИНИМАЛЬНАЯ рабочая конвертация — только пути, без опций"""
+def convert_book(input_path: str, output_path: str, cover_path: str = None) -> tuple[bool, str]:
+    """Конвертация с ручным указанием обложки если найдена"""
     try:
         input_abs = str(Path(input_path).resolve())
         output_abs = str(Path(output_path).resolve())
+        cover_abs = str(Path(cover_path).resolve()) if cover_path else None
         
         input_p = Path(input_abs)
         if not input_p.exists() or input_p.stat().st_size == 0:
             return False, "Файл не найден или пустой"
         
-        # Только 2 аргумента — входной и выходной файлы
+        # Формируем команду
         cmd = ["ebook-convert", input_abs, output_abs]
         
-        logger.info(f"Конвертация: {input_p.name} → {Path(output_abs).name}")
+        # Добавляем обложку если найдена
+        if cover_abs and Path(cover_abs).exists():
+            cmd.extend(["--cover", cover_abs])
+            logger.info(f"Конвертация с обложкой: {cover_abs}")
+        else:
+            logger.info("Конвертация без обложки (не найдена во входном файле)")
         
         result = subprocess.run(
             cmd,
@@ -121,14 +153,32 @@ def convert_book(input_path: str, output_path: str) -> tuple[bool, str]:
         
         output_p = Path(output_abs)
         if result.returncode != 0:
-            logger.error(f"STDERR ebook-convert: {result.stderr[:500]}")
+            logger.error(f"STDERR: {result.stderr[:500]}")
             error_preview = result.stderr[:400].replace('\n', ' | ')
             return False, f"Код {result.returncode} | {error_preview}"
         
         if not output_p.exists() or output_p.stat().st_size == 0:
             return False, f"Выходной файл не создан ({output_p.stat().st_size} байт)"
         
-        return True, f"{output_p.stat().st_size / 1024:.1f} КБ"
+        # Проверяем наличие обложки в результате
+        has_cover = False
+        try:
+            meta_result = subprocess.run(
+                ["ebook-meta", str(output_p)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                encoding='utf-8',
+                errors='replace'
+            )
+            if "cover" in meta_result.stdout.lower():
+                has_cover = True
+        except:
+            pass
+        
+        size_info = f"{output_p.stat().st_size / 1024:.1f} КБ"
+        cover_info = " ✓ с обложкой" if has_cover else " ✗ без обложки"
+        return True, f"{size_info}{cover_info}"
         
     except subprocess.TimeoutExpired:
         return False, "Таймаут 180 сек"
@@ -146,17 +196,22 @@ async def conversion_worker(application: Application):
             task_id = task["task_id"]
             active_tasks[task_id]["status"] = "converting"
             
-            # Извлекаем метаданные ДО конвертации
+            # Извлекаем метаданные
             metadata = extract_metadata(task["input_path"])
             title = metadata["title"] or "Без названия"
             author = metadata["authors"][0] if metadata["authors"] else "Неизвестен"
-            has_cover = metadata["has_cover"]
+            
+            # Извлекаем обложку
+            cover_path = f"{task['input_path']}.cover.jpg"
+            has_cover = extract_cover(task["input_path"], cover_path)
             
             # Обновляем статус
             try:
                 status_text = f"⏳ Конвертирую:\n<b>{title}</b>\n<i>{author}</i>"
-                if not has_cover:
-                    status_text += "\n⚠️ Обложка не обнаружена во входном файле"
+                if has_cover:
+                    status_text += "\n🖼️ Обложка найдена — добавляю в книгу"
+                else:
+                    status_text += "\n🔍 Обложка не найдена во входном файле"
                 await application.bot.edit_message_text(
                     chat_id=task["user_id"],
                     message_id=task["message_id"],
@@ -166,16 +221,16 @@ async def conversion_worker(application: Application):
             except Exception as e:
                 logger.warning(f"Не удалось обновить статус: {e}")
             
-            # Конвертируем БЕЗ ОПЦИЙ
+            # Конвертируем с обложкой (если найдена)
             success, diag = convert_book(
                 task["input_path"],
-                task["output_path"]
+                task["output_path"],
+                cover_path if has_cover else None
             )
             
             # Отправляем результат
             output_path = Path(task["output_path"])
             if success and output_path.exists():
-                # Формируем безопасное имя файла
                 safe_title = re.sub(r'[<>:"/\\|?*]', '', title)[:50]
                 safe_author = re.sub(r'[<>:"/\\|?*]', '', author)[:30]
                 output_ext = output_path.suffix
@@ -187,8 +242,6 @@ async def conversion_worker(application: Application):
                     f"👤 {author}\n"
                     f"📦 {diag}"
                 )
-                if not has_cover:
-                    caption += "\n\n⚠️ Обложка отсутствовала во входном файле"
                 
                 await application.bot.send_document(
                     chat_id=task["user_id"],
@@ -211,7 +264,7 @@ async def conversion_worker(application: Application):
                 )
             
             # Чистим временные файлы
-            for p in [task["input_path"], task["output_path"]]:
+            for p in [task["input_path"], task["output_path"], cover_path]:
                 try:
                     fp = Path(p)
                     if fp.exists():
@@ -232,10 +285,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = (
         "📚 <b>KindleGarden Bot</b>\n\n"
         "Отправляй FB2/EPUB → получаешь книгу для Kindle!\n\n"
-        "✅ Поддерживаемые форматы:\n"
-        "• <b>AZW3</b> — рекомендуется для современных Kindle\n"
-        "• <b>EPUB</b> — универсальный формат (поддерживается с 2022 г.)\n"
-        "• <b>MOBI</b> — для очень старых устройств"
+        "✨ Особенности:\n"
+        "• Автоматическое извлечение обложки из FB2\n"
+        "• Корректное сохранение автора и названия\n"
+        "• Очередь обработки (макс. 5 файлов)\n\n"
+        "⚠️ Обложка должна быть встроена в исходный файл"
     )
     await update.message.reply_text(
         message,
@@ -246,15 +300,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = (
-        "📚 <b>Как пользоваться ботом:</b>\n\n"
-        "1️⃣ Отправь FB2 или EPUB файл (макс. 10 МБ)\n"
-        "2️⃣ Бот автоматически конвертирует его в выбранный формат\n"
-        "3️⃣ Получи файл с обложкой и метаданными для Kindle!\n\n"
-        "💡 <b>Важно:</b>\n"
-        "• Обложка и метаданные должны быть встроены в исходный файл\n"
-        "• Проверь файл в Calibre на ПК перед отправкой\n"
-        "• На малинке 3 конвертация занимает 15–60 секунд\n\n"
-        "⚙️ Изменить формат по умолчанию: кнопка «⚙️ Настройки»"
+        "📚 <b>Как получить обложку в результате:</b>\n\n"
+        "1️⃣ <b>Проверь исходный файл в Calibre (на ПК):</b>\n"
+        "   • Открой FB2 → справа должна быть видна обложка\n"
+        "   • Если нет — добавь через «Загрузить обложку»\n\n"
+        "2️⃣ <b>Сохрани изменения:</b>\n"
+        "   • Calibre: ПКМ → «Сохранить на диск»\n\n"
+        "3️⃣ <b>Отправь исправленный файл в бота</b>\n\n"
+        "💡 Бот автоматически извлечёт обложку через <code>ebook-meta</code> и добавит её в конвертированную книгу."
     )
     await update.message.reply_text(
         message,
@@ -320,7 +373,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    # Генерируем простые имена файлов без спецсимволов
+    # Генерируем простые имена файлов
     base_tmp = Path.cwd() / "tmp"
     simple_id = str(uuid4()).replace("-", "")[:12]
     input_ext = Path(filename).suffix or ".fb2"
@@ -346,12 +399,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         file = await context.bot.get_file(document.file_id)
         await file.download_to_drive(task_info["input_path"])
         
-        # 🔑 ПРОВЕРКА 1: файл не пустой
+        # Проверка 1: файл не пустой
         input_size = Path(task_info["input_path"]).stat().st_size
         if input_size == 0:
             raise ValueError("Файл пустой (0 байт)")
         
-        # 🔑 ПРОВЕРКА 2: для FB2 — валидный XML
+        # Проверка 2: для FB2 — валидный XML
         if input_ext.lower() == ".fb2":
             with open(task_info["input_path"], "rb") as f:
                 header = f.read(200).decode("utf-8", errors="ignore")
@@ -362,10 +415,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception as e:
         logger.error(f"Отклонён файл: {e}")
         await update.message.reply_text(
-            f"❌ Некорректный файл: {str(e)}\n\nУбедись, что файл не повреждён и имеет правильную структуру.",
+            f"❌ Некорректный файл: {str(e)}\n\nУбедись, что файл не повреждён.",
             reply_markup=MAIN_REPLY_KEYBOARD
         )
-        # Чистим временный файл
         try:
             Path(task_info["input_path"]).unlink(missing_ok=True)
         except:
@@ -390,7 +442,7 @@ async def handle_text_commands(update: Update, context: ContextTypes.DEFAULT_TYP
     if text == "📚 Отправить книгу":
         await update.message.reply_text(
             "📎 Прикрепи FB2 или EPUB файл (макс. 10 МБ)\n\n"
-            "💡 Совет: убедись, что в файле есть обложка и заполнены метаданные (автор/название)",
+            "💡 Бот автоматически извлечёт обложку если она есть во входном файле",
             reply_markup=MAIN_REPLY_KEYBOARD
         )
     elif text == "⚙️ Настройки":
@@ -406,22 +458,23 @@ async def handle_text_commands(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def post_init(application: Application) -> None:
     # Проверяем зависимости
-    for tool in ["ebook-convert", "ebook-meta"]:
+    tools = ["ebook-convert", "ebook-meta"]
+    for tool in tools:
         try:
             subprocess.run([tool, "--version"], capture_output=True, timeout=5)
             logger.info(f"✅ {tool} доступен")
         except Exception as e:
             logger.error(f"❌ {tool} не установлен: {e}")
-            raise RuntimeError(f"Требуется {tool}. Установи: sudo apt install calibre")
+            raise RuntimeError(f"Требуется {tool}. Выполни: sudo apt install calibre")
     
     asyncio.create_task(conversion_worker(application))
-    logger.info("✅ Воркер конвертации запущен")
+    logger.info("✅ Воркер запущен с поддержкой извлечения обложек")
 
 
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        logger.error("❌ Токен не найден! Создай файл .env с TELEGRAM_BOT_TOKEN")
+        logger.error("❌ Токен не найден! Создай .env с TELEGRAM_BOT_TOKEN")
         return
 
     application = Application.builder().token(token).post_init(post_init).build()
@@ -433,7 +486,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_commands))
     application.add_handler(CallbackQueryHandler(handle_format_setting, pattern="^setfmt:"))
 
-    logger.info("🚀 Бот запущен! Макс. очередь: 5 файлов")
+    logger.info("🚀 Бот запущен! Автоматическое извлечение обложек через ebook-meta")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

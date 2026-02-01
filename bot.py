@@ -97,7 +97,7 @@ def extract_metadata(input_path: str) -> dict:
 
 
 def convert_book(input_path: str, output_path: str, output_format: str) -> tuple[bool, str]:
-    """Конвертация с минимальными опциями (стабильно на малинке)"""
+    """Конвертация с опциями для корректного извлечения метаданных из FB2"""
     try:
         input_abs = str(Path(input_path).resolve())
         output_abs = str(Path(output_path).resolve())
@@ -106,7 +106,10 @@ def convert_book(input_path: str, output_path: str, output_format: str) -> tuple
         if not input_p.exists() or input_p.stat().st_size == 0:
             return False, "Файл не найден или пустой"
         
-        # Минимальная рабочая команда
+        # Определяем, является ли файл FB2 (для специфичных опций)
+        is_fb2 = input_p.suffix.lower() in (".fb2", ".fb2.zip")
+        
+        # КОМБО ОПЦИЙ ДЛЯ FB2 — решает проблему с метаданными и обложкой
         cmd = [
             "ebook-convert",
             input_abs,
@@ -114,7 +117,16 @@ def convert_book(input_path: str, output_path: str, output_format: str) -> tuple
             "--output-profile", "kindle",
         ]
         
-        logger.info(f"Конвертация: {Path(input_abs).name} → {Path(output_abs).name}")
+        if is_fb2:
+            cmd.extend([
+                "--pretty-print",          # Корректный парсинг XML структуры FB2
+                "--input-encoding", "utf-8",  # Явная кодировка
+                "--preserve-cover-aspect-ratio",  # Сохранение пропорций обложки
+            ])
+        
+        logger.info(f"Конвертация {'(FB2)' if is_fb2 else ''}: {Path(input_abs).name} → {Path(output_abs).name}")
+        logger.debug(f"Команда: {' '.join(cmd)}")
+        
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -126,7 +138,7 @@ def convert_book(input_path: str, output_path: str, output_format: str) -> tuple
         
         output_p = Path(output_abs)
         if result.returncode != 0:
-            error_preview = result.stderr[:300].replace('\n', ' | ')
+            error_preview = result.stderr[:400].replace('\n', ' | ')
             return False, f"Код {result.returncode} | {error_preview}"
         
         if not output_p.exists() or output_p.stat().st_size == 0:

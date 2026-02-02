@@ -1,3 +1,16 @@
 cd ~/kindlegarden-bot
 source venv/bin/activate
 python bot.py
+
+
+Проверить статус службы:
+sudo systemctl status kindlegarden-bot.service
+
+Просмотр логов:
+sudo journalctl -u kindlegarden-bot.service -f
+
+Если нужно остановить службу:
+sudo systemctl stop kindlegarden-bot.service
+
+Если вносите изменения в службу, не забудьте выполнить:
+sudo systemctl daemon-reload

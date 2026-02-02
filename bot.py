@@ -228,27 +228,24 @@ def extract_cover(input_path: str, cover_path: str) -> bool:
 
 
 def convert_book(input_path: str, output_path: str, cover_path: str = None) -> tuple[bool, str]:
-    """Конвертация с правильным формированием аргументов для миниатюры в библиотеке"""
+    """Конвертация с защитой от пустых аргументов"""
     try:
         input_abs = str(Path(input_path).resolve())
         output_abs = str(Path(output_path).resolve())
-        cover_abs = str(Path(cover_path).resolve()) if cover_path else None
         
-        # Формируем команду — КАЖДАЯ опция и её значение как отдельный элемент списка!
+        # Формируем команду — ТОЛЬКО валидные аргументы
         cmd = ["ebook-convert", input_abs, output_abs]
         
-        if cover_abs and Path(cover_abs).exists():
-            cmd.extend(["--cover", cover_abs])
-            logger.info(f"Конвертация с обложкой: {cover_abs}")
+        # Добавляем обложку ТОЛЬКО если путь валидный
+        if cover_path and Path(cover_path).exists() and Path(cover_path).stat().st_size > 500:
+            cmd.extend(["--cover", cover_path])
+            logger.info(f"Конвертация с обложкой: {cover_path}")
         else:
             logger.info("Конвертация без обложки")
         
-        # 🔑 КРИТИЧЕСКИ ВАЖНО: каждая опция и значение — отдельные элементы списка!
+        # 🔑 МИНИМАЛЬНЫЙ НАБОР ОПЦИЙ ДЛЯ МИНИАТЮРЫ (без риска сломать парсинг)
         cmd.extend([
-            "--output-profile", "kindle_pw3",  # ← два элемента
-            "--pretty-print",                   # ← один элемент (флаг)
-            "--no-inline-toc",                  # ← один элемент (флаг)
-            "--cover-margin", "0",              # ← два элемента (ключ + значение)
+            "--output-profile", "kindle",  # ← kindle вместо kindle_pw3 (универсальнее)
         ])
         
         logger.debug(f"Команда: {' '.join(cmd)}")
@@ -270,10 +267,10 @@ def convert_book(input_path: str, output_path: str, cover_path: str = None) -> t
         if not output_p.exists() or output_p.stat().st_size == 0:
             return False, "Файл не создан"
         
-        # Проверяем наличие обложки в метаданных результата
-        has_cover_in_result = False
+        # Проверяем наличие обложки в метаданных
+        has_cover = False
         try:
-            meta_result = subprocess.run(
+            meta = subprocess.run(
                 ["ebook-meta", str(output_p)],
                 capture_output=True,
                 text=True,
@@ -281,12 +278,12 @@ def convert_book(input_path: str, output_path: str, cover_path: str = None) -> t
                 encoding='utf-8',
                 errors='replace'
             )
-            has_cover_in_result = "cover" in meta_result.stdout.lower()
+            has_cover = "cover" in meta.stdout.lower()
         except:
             pass
         
         size_info = f"{output_p.stat().st_size / 1024:.1f} КБ"
-        cover_info = " ✓ миниатюра в библиотеке" if has_cover_in_result else " ✗ без миниатюры"
+        cover_info = " ✓ миниатюра" if has_cover else " ✗ без миниатюры"
         return True, f"{size_info}{cover_info}"
         
     except subprocess.TimeoutExpired:
@@ -294,7 +291,7 @@ def convert_book(input_path: str, output_path: str, cover_path: str = None) -> t
     except Exception as e:
         logger.error(f"Ошибка конвертации: {e}", exc_info=True)
         return False, str(e)[:150]
-        
+
 
 async def conversion_worker(application: Application):
     logger.info("🔄 Воркер запущен")

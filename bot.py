@@ -260,7 +260,7 @@ def extract_cover_improved(input_path: str, cover_path: str) -> bool:
         return False
 
 
-def convert_book_with_cover(input_path: str, output_path: str, cover_path: str = None) -> tuple[bool, str]:
+ddef convert_book_with_cover(input_path: str, output_path: str, cover_path: str = None) -> tuple[bool, str]:
     """Конвертация с правильной вставкой обложки"""
     try:
         input_abs = str(Path(input_path).resolve())
@@ -297,14 +297,20 @@ def convert_book_with_cover(input_path: str, output_path: str, cover_path: str =
             # Даже без обложки добавляем опцию для лучшего результата
             cmd.append("--no-default-epub-cover")
         
-        # Добавляем метаданные для лучшей обработки
+        # УБИРАЕМ пустые --title= и --authors= - они вызывают ошибку
+        # Вместо этого добавляем только важные опции
         cmd.extend([
-            "--title=",  # Автоматически извлекается из файла
-            "--authors=", # Автоматически извлекается из файла
             "--linearize-tables"  # Для лучшего отображения
         ])
         
-        logger.info(f"Выполняю команду: {' '.join(cmd)}")
+        # Для FB2 добавляем опции для лучшей обработки
+        if input_path.lower().endswith('.fb2'):
+            cmd.extend([
+                "--embed-all-fonts",
+                "--subset-embedded-fonts"
+            ])
+        
+        logger.info(f"Выполняю команду: {' '.join(cmd[:5])}...")  # Логируем только начало команды
         
         result = subprocess.run(
             cmd,
@@ -316,6 +322,8 @@ def convert_book_with_cover(input_path: str, output_path: str, cover_path: str =
         )
         
         # Логируем вывод для отладки
+        if result.stdout:
+            logger.debug(f"Stdout конвертации: {result.stdout[:500]}")
         if result.stderr:
             logger.warning(f"Stderr конвертации: {result.stderr[:500]}")
         
@@ -323,7 +331,14 @@ def convert_book_with_cover(input_path: str, output_path: str, cover_path: str =
         if result.returncode != 0 or not output_p.exists() or output_p.stat().st_size == 0:
             error_msg = f"Код {result.returncode}"
             if result.stderr:
-                error_msg += f"\n{result.stderr[:200]}"
+                # Пытаемся извлечь полезную информацию из stderr
+                error_lines = []
+                for line in result.stderr.split('\n'):
+                    line = line.strip()
+                    if line and not line.startswith("Usage:") and not line.startswith("Convert"):
+                        error_lines.append(line[:200])
+                if error_lines:
+                    error_msg += f"\n{'. '.join(error_lines[:3])}"
             return False, error_msg
         
         # Проверяем, есть ли обложка в выходном файле
@@ -339,9 +354,12 @@ def convert_book_with_cover(input_path: str, output_path: str, cover_path: str =
                 )
                 if "Cover: Yes" in check_result.stdout:
                     cover_check = " ✓ обложка встроена"
+                elif "Has cover: yes" in check_result.stdout:
+                    cover_check = " ✓ обложка встроена"
                 else:
                     cover_check = " ⚠️ обложка не встроена"
-            except:
+            except Exception as e:
+                logger.debug(f"Не удалось проверить обложку: {e}")
                 cover_check = " ? статус обложки неизвестен"
         
         size_info = f"{output_p.stat().st_size / 1024 / 1024:.2f} МБ"

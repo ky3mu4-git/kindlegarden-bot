@@ -164,63 +164,76 @@ def extract_metadata(input_path: str) -> dict:
 def extract_cover_improved(input_path: str, cover_path: str) -> bool:
     """Улучшенное извлечение обложки с несколькими методами"""
     try:
-        # Метод 1: ebook-meta (самый надежный)
+        # Метод 1: ebook-meta (самый надежный) - ПРАВИЛЬНЫЙ ПОРЯДОК АРГУМЕНТОВ
         try:
             subprocess.run(
-                ["ebook-meta", "--get-cover", cover_path, input_path],
+                ["ebook-meta", input_path, "--get-cover", cover_path],
                 capture_output=True,
                 timeout=30
             )
             if Path(cover_path).exists() and Path(cover_path).stat().st_size > 1000:
-                logger.info(f"✅ Обложка извлечена ebook-meta")
+                logger.info(f"✅ Обложка извлечена ebook-meta ({Path(cover_path).stat().st_size} байт)")
                 return True
         except Exception as e:
             logger.warning(f"ebook-meta не сработал: {e}")
         
-        # Метод 2: ручной парсинг FB2
+        # Метод 2: для FB2 - ручной парсинг
         if input_path.lower().endswith('.fb2'):
             logger.info("🔍 Ручной парсинг FB2 для обложки...")
             try:
                 with open(input_path, "rb") as f:
                     content = f.read()
                 
-                # Пытаемся найти coverpage ссылку
-                text_content = content.decode('utf-8', errors='ignore') if isinstance(content, bytes) else content
+                # Декодируем с правильной кодировкой
+                for enc in ["utf-8", "cp1251", "koi8-r"]:
+                    try:
+                        text_content = content.decode(enc)
+                        break
+                    except:
+                        continue
+                else:
+                    text_content = content.decode("utf-8", errors="ignore")
                 
                 # Ищем coverpage
-                coverpage_match = re.search(r'<coverpage>.*?<image l:href="#([^"]+)".*?>.*?</coverpage>', 
+                coverpage_match = re.search(r'<coverpage>.*?<image[^>]+l:href=["\']#([^"\']+)["\'][^>]*>.*?</coverpage>', 
                                           text_content, re.DOTALL | re.IGNORECASE)
                 
                 if coverpage_match:
                     cover_id = coverpage_match.group(1)
+                    logger.info(f"Найдена ссылка на обложку: #{cover_id}")
+                    
                     # Ищем binary с этим id
-                    binary_pattern = f'<binary id="{cover_id}"[^>]*>([^<]+)</binary>'
+                    binary_pattern = f'<binary[^>]+id=["\']{re.escape(cover_id)}["\'][^>]*>([^<]+)</binary>'
                     binary_match = re.search(binary_pattern, text_content, re.IGNORECASE)
                     
                     if binary_match:
-                        image_data = base64.b64decode(binary_match.group(1).strip())
-                        with open(cover_path, "wb") as f:
-                            f.write(image_data)
-                        
-                        if Path(cover_path).stat().st_size > 1000:
-                            logger.info(f"✅ Обложка найдена по coverpage: {cover_id}")
-                            return True
-                
-                # Ищем любой binary с изображением (fallback)
-                binary_pattern = r'<binary[^>]+content-type="image/[^"]+"[^>]*>([^<]+)</binary>'
-                all_binaries = re.findall(binary_pattern, text_content, re.IGNORECASE)
-                
-                for binary_data in all_binaries:
-                    try:
-                        image_data = base64.b64decode(binary_data.strip())
-                        if len(image_data) > 50000:  # Берем только большие изображения
+                        try:
+                            image_data = base64.b64decode(binary_match.group(1).strip())
                             with open(cover_path, "wb") as f:
                                 f.write(image_data)
                             
                             if Path(cover_path).stat().st_size > 1000:
-                                logger.info(f"✅ Обложка найдена в binary данных")
+                                logger.info(f"✅ Обложка найдена по coverpage: {cover_id} ({Path(cover_path).stat().st_size} байт)")
                                 return True
-                    except:
+                        except Exception as e:
+                            logger.warning(f"Ошибка декодирования обложки: {e}")
+                
+                # Ищем любой binary с изображением (fallback)
+                binary_pattern = r'<binary[^>]+content-type=["\']image/(jpeg|jpg|png)["\'][^>]*>([^<]+)</binary>'
+                all_binaries = re.findall(binary_pattern, text_content, re.IGNORECASE)
+                
+                for img_type, binary_data in all_binaries:
+                    try:
+                        image_data = base64.b64decode(binary_data.strip())
+                        if len(image_data) > 10000:  # Берем только большие изображения (>10KB)
+                            with open(cover_path, "wb") as f:
+                                f.write(image_data)
+                            
+                            if Path(cover_path).stat().st_size > 1000:
+                                logger.info(f"✅ Обложка найдена в binary данных ({Path(cover_path).stat().st_size} байт)")
+                                return True
+                    except Exception as e:
+                        logger.debug(f"Не удалось декодировать binary: {e}")
                         continue
                         
             except Exception as e:
@@ -230,28 +243,67 @@ def extract_cover_improved(input_path: str, cover_path: str) -> bool:
         elif input_path.lower().endswith('.epub'):
             logger.info("🔍 Извлечение обложки из EPUB...")
             try:
-                # Создаем временный файл
-                temp_dir = Path(input_path).parent / "temp_cover"
-                temp_dir.mkdir(exist_ok=True)
-                
                 # Используем ebook-convert для извлечения обложки
-                cmd = ["ebook-convert", input_path, str(temp_dir / "cover.jpg"), "--cover"]
-                result = subprocess.run(cmd, capture_output=True, timeout=30)
+                temp_cover = cover_path + ".temp.jpg"
+                cmd = ["ebook-convert", input_path, temp_cover, "--dont-output"]
                 
-                cover_file = temp_dir / "cover.jpg"
-                if cover_file.exists() and cover_file.stat().st_size > 1000:
-                    import shutil
-                    shutil.copy2(cover_file, cover_path)
-                    shutil.rmtree(temp_dir)
-                    logger.info(f"✅ Обложка извлечена из EPUB")
-                    return True
-                    
-                # Очистка
-                if temp_dir.exists():
-                    shutil.rmtree(temp_dir)
+                result = subprocess.run(cmd, capture_output=True, timeout=60)
+                
+                # Проверяем несколько возможных мест
+                possible_covers = [
+                    temp_cover,
+                    cover_path,
+                    os.path.join(os.path.dirname(input_path), "cover.jpg"),
+                ]
+                
+                for possible_path in possible_covers:
+                    if Path(possible_path).exists() and Path(possible_path).stat().st_size > 1000:
+                        if possible_path != cover_path:
+                            import shutil
+                            shutil.copy2(possible_path, cover_path)
+                        logger.info(f"✅ Обложка извлечена из EPUB ({Path(cover_path).stat().st_size} байт)")
+                        # Удаляем временные файлы
+                        for p in [temp_cover, os.path.join(os.path.dirname(input_path), "cover.jpg")]:
+                            try:
+                                if p != cover_path and Path(p).exists():
+                                    Path(p).unlink()
+                            except:
+                                pass
+                        return True
+                
+                # Очистка временных файлов
+                for p in [temp_cover, os.path.join(os.path.dirname(input_path), "cover.jpg")]:
+                    try:
+                        if Path(p).exists():
+                            Path(p).unlink()
+                    except:
+                        pass
                     
             except Exception as e:
                 logger.warning(f"Ошибка извлечения из EPUB: {e}")
+        
+        # Метод 4: попробуем через calibre напрямую
+        try:
+            # Пробуем еще раз ebook-meta с правильными аргументами
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+                tmp_cover = tmp.name
+            
+            result = subprocess.run(
+                ["ebook-meta", input_path, "--get-cover", tmp_cover],
+                capture_output=True,
+                timeout=30
+            )
+            
+            if Path(tmp_cover).exists() and Path(tmp_cover).stat().st_size > 1000:
+                import shutil
+                shutil.copy2(tmp_cover, cover_path)
+                Path(tmp_cover).unlink()
+                logger.info(f"✅ Обложка извлечена через temp файл ({Path(cover_path).stat().st_size} байт)")
+                return True
+                
+        except Exception as e:
+            logger.debug(f"Дополнительный метод не сработал: {e}")
         
         return False
         
@@ -260,7 +312,7 @@ def extract_cover_improved(input_path: str, cover_path: str) -> bool:
         return False
 
 
-ddef convert_book_with_cover(input_path: str, output_path: str, cover_path: str = None) -> tuple[bool, str]:
+def convert_book_with_cover(input_path: str, output_path: str, cover_path: str = None) -> tuple[bool, str]:
     """Конвертация с правильной вставкой обложки"""
     try:
         input_abs = str(Path(input_path).resolve())
@@ -528,23 +580,28 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "✅ <b>Как работают обложки:</b>\n"
         "• Бот извлекает обложку из исходного файла\n"
         "• Встраивает её в сконвертированную книгу\n"
-        "• Для MOBI: обложка может не показываться в библиотеке\n"
-        "• Для AZW3: обложка показывается всегда\n\n"
+        "• <b>Важно:</b> Обложка должна быть в формате JPEG/PNG\n\n"
         
-        "🔄 <b>Форматы:</b>\n"
+        "🔄 <b>Форматы и обложки:</b>\n"
         "• <b>AZW3</b> - лучшая поддержка обложек, новые Kindle\n"
-        "• <b>MOBI</b> - старые Kindle, обложки через email\n"
-        "• <b>EPUB</b> - другие читалки\n\n"
+        "• <b>MOBI</b> - старые Kindle, могут быть проблемы с отображением\n"
+        "• <b>EPUB</b> - другие читалки, обычно без проблем\n\n"
         
-        "📧 <b>Для MOBI обложек:</b>\n"
-        "1. Отправьте файл на email Kindle\n"
-        "2. В теме письма напишите <code>convert</code>\n"
+        "⚠️ <b>Почему обложка может не отображаться:</b>\n"
+        "1. Исходный файл не содержит обложку\n"
+        "2. Обложка слишком маленькая (< 600x800)\n"
+        "3. Старый Kindle (1-5 поколение)\n"
+        "4. Файл отправлен не через email\n\n"
+        
+        "📧 <b>Для гарантированного отображения обложки:</b>\n"
+        "1. Используйте формат <b>AZW3</b>\n"
+        "2. Отправляйте на email Kindle с темой <code>convert</code>\n"
         "3. Или используйте Calibre для отправки\n\n"
         
-        "⚙️ <b>Рекомендации:</b>\n"
-        "• Используйте AZW3 для новых Kindle\n"
-        "• Размер файла до 50 МБ\n"
-        "• Обложка должна быть в формате JPEG"
+        "⚙️ <b>Ограничения:</b>\n"
+        "• Максимальный размер файла: 50 МБ\n"
+        "• Время конвертации: до 5 минут\n"
+        "• Очередь: 5 файлов одновременно"
     )
     await update.message.reply_text(
         message,
@@ -605,9 +662,6 @@ async def handle_format_setting(update: Update, context: ContextTypes.DEFAULT_TY
         reply_markup=MAIN_REPLY_KEYBOARD
     )
 
-
-# Остальные функции (handle_document, handle_text, post_init, main) оставляем без изменений
-# ...
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     doc = update.message.document
@@ -729,19 +783,31 @@ async def post_init(app: Application) -> None:
     
     for tool in required_tools:
         try:
-            subprocess.run([tool, "--version"], capture_output=True, timeout=5)
-            logger.info(f"✅ {tool} доступен")
-        except:
+            result = subprocess.run([tool, "--version"], capture_output=True, timeout=5)
+            if result.returncode == 0:
+                logger.info(f"✅ {tool} доступен")
+            else:
+                missing_tools.append(tool)
+                logger.error(f"❌ {tool} не работает правильно")
+        except Exception as e:
             missing_tools.append(tool)
-            logger.error(f"❌ {tool} не найден")
+            logger.error(f"❌ {tool} не найден: {e}")
     
     if missing_tools:
-        error_msg = "Не установлены:\n" + "\n".join(missing_tools)
+        error_msg = "Не установлены или не работают:\n" + "\n".join(missing_tools)
         logger.critical(error_msg)
         raise RuntimeError(
             f"{error_msg}\n"
-            f"Выполните: sudo apt update && sudo apt install calibre"
+            f"Выполните на Raspberry Pi:\n"
+            f"sudo apt update && sudo apt install -y calibre"
         )
+    
+    # Проверяем версию Calibre
+    try:
+        result = subprocess.run(["ebook-convert", "--version"], capture_output=True, text=True, timeout=5)
+        logger.info(f"Версия Calibre: {result.stdout.strip()}")
+    except:
+        logger.warning("Не удалось проверить версию Calibre")
     
     asyncio.create_task(conversion_worker(app))
     logger.info("✅ Бот готов к работе")

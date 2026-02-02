@@ -139,13 +139,15 @@ def extract_cover(input_path: str, cover_path: str) -> bool:
                     content = f.read()
                 
                 # Пробуем разные кодировки
+                text = None
                 for encoding in ['utf-8', 'cp1251', 'koi8-r']:
                     try:
                         text = content.decode(encoding)
                         break
                     except:
                         continue
-                else:
+                
+                if text is None:
                     text = content.decode('utf-8', errors='ignore')
                 
                 # Ищем все binary с изображениями
@@ -162,8 +164,11 @@ def extract_cover(input_path: str, cover_path: str) -> bool:
                             if Path(cover_path).stat().st_size > 1000:
                                 logger.info(f"Обложка извлечена из FB2: {Path(cover_path).stat().st_size} байт")
                                 return True
-                    except:
+                    except Exception as e:
+                        logger.debug(f"Не удалось декодировать обложку: {e}")
                         continue
+            except Exception as e:
+                logger.debug(f"Ошибка при парсинге FB2: {e}")
         
         # Метод 3: попробуем конвертировать в PDF с обложкой и извлечь
         try:
@@ -178,7 +183,7 @@ def extract_cover(input_path: str, cover_path: str) -> bool:
             
             # Ищем обложку в папке с файлом
             possible_covers = [
-                cover_path,
+                Path(cover_path),
                 Path(input_path).parent / "cover.jpg",
                 Path(input_path).parent / "cover.png",
             ]

@@ -5,7 +5,6 @@ import subprocess
 import re
 import base64
 import zipfile
-import tempfile
 import shutil
 from pathlib import Path
 from uuid import uuid4
@@ -266,7 +265,8 @@ def convert_book_simple(input_path: str, output_path: str, cover_path: str = Non
                         else:
                             cover_check = " ✗ без обложки"
                         break
-        except:
+        except Exception as e:
+            logger.debug(f"Не удалось проверить обложку: {e}")
             cover_check = ""
         
         size_info = f"{output_p.stat().st_size / 1024 / 1024:.2f} МБ"

@@ -227,21 +227,29 @@ def extract_cover(input_path: str, cover_path: str) -> bool:
         return False
 
 
-def convert_book(input_path: str, output_path: str, cover_path: str = None) -> tuple[bool, str]:
-    """Конвертация + принудительное обновление метаданных обложкой для миниатюры"""
+ddef convert_book(input_path: str, output_path: str, cover_path: str = None) -> tuple[bool, str]:
+    """Конвертация с обложкой (без ложных обещаний про миниатюру)"""
     try:
         input_abs = str(Path(input_path).resolve())
         output_abs = str(Path(output_path).resolve())
         
-        # Шаг 1: конвертируем БЕЗ обложки (чистая конвертация)
+        # Шаг 1: конвертируем
         cmd = ["ebook-convert", input_abs, output_abs]
         
-        # Для MOBI на старых Kindle — сохраняем оригинальные изображения
+        # Для старых Kindle — сохраняем оригинальные изображения
         output_ext = Path(output_abs).suffix.lower()
         if output_ext == ".mobi":
             cmd.append("--mobi-keep-original-images")
         
-        logger.info(f"Конвертация: {Path(input_abs).name} → {Path(output_abs).name}")
+        # Добавляем обложку если есть
+        has_cover_arg = False
+        if cover_path and Path(cover_path).exists() and Path(cover_path).stat().st_size > 500:
+            cmd.extend(["--cover", cover_path])
+            has_cover_arg = True
+            logger.info(f"Конвертация с обложкой: {cover_path}")
+        else:
+            logger.info("Конвертация без обложки")
+        
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -253,32 +261,11 @@ def convert_book(input_path: str, output_path: str, cover_path: str = None) -> t
         
         output_p = Path(output_abs)
         if result.returncode != 0 or not output_p.exists() or output_p.stat().st_size == 0:
-            return False, f"Ошибка конвертации (код {result.returncode})"
+            return False, f"Код {result.returncode}"
         
-        # Шаг 2: ЕСЛИ есть обложка — принудительно вшиваем её в метаданные
-        has_cover = False
-        if cover_path and Path(cover_path).exists() and Path(cover_path).stat().st_size > 500:
-            logger.info(f"Вшиваем обложку в метаданные: {cover_path}")
-            meta_cmd = ["ebook-meta", output_abs, "--cover", cover_path]
-            meta_result = subprocess.run(
-                meta_cmd,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                encoding='utf-8',
-                errors='replace'
-            )
-            if meta_result.returncode == 0:
-                has_cover = True
-                logger.info("Обложка успешно вшита в метаданные")
-            else:
-                logger.warning(f"Не удалось вшить обложку в метаданные (код {meta_result.returncode})")
-        else:
-            logger.info("Обложка отсутствует — пропускаем вшивание")
-        
-        # Проверяем результат
+        # 🔑 ЧЕСТНЫЙ СТАТУС: не обещаем миниатюру — только факт добавления обложки
         size_info = f"{output_p.stat().st_size / 1024:.1f} КБ"
-        cover_info = " ✓ миниатюра в библиотеке" if has_cover else " ⚠️ обложка внутри, но нет миниатюры"
+        cover_info = " ✓ с обложкой" if has_cover_arg else " ✗ без обложки"
         return True, f"{size_info}{cover_info}"
         
     except subprocess.TimeoutExpired:
@@ -394,10 +381,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = (
+        "📚 <b>Как работает бот:</b>\n\n"
+        "✅ <b>Что делает бот:</b>\n"
+        "• Извлекает обложку из FB2/EPUB\n"
+        "• Добавляет её внутрь сконвертированной книги\n"
+        "• Сохраняет автора и название в метаданных\n\n"
+        "⚠️ <b>Важно про миниатюры:</b>\n"
+        "• Отображение миниатюры в библиотеке Kindle зависит от:\n"
+        "  — Версии устройства (старые Kindle 1-2 поколения требовательны)\n"
+        "  — Размера исходной обложки (минимум 240×320 пикселей)\n"
+        "  — Внутренней структуры метаданных (ограничение Calibre)\n\n"
+        "💡 <b>Совет:</b>\n"
+        "Если миниатюра критична — конвертируй через fb2kindle на ПК,\n"
+        "а готовый файл отправляй на малинку для раздачи."
+    )
     await update.message.reply_text(
-        "💡 <b>Важно:</b>\n"
-        "Многие книги распространяются как <b>сжатые архивы</b> (.fb2.zip),\n"
-        "но имеют расширение .fb2. Бот автоматически распознаёт и распаковывает их!",
+        message,
         parse_mode=ParseMode.HTML,
         reply_markup=MAIN_REPLY_KEYBOARD
     )

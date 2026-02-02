@@ -228,28 +228,30 @@ def extract_cover(input_path: str, cover_path: str) -> bool:
 
 
 def convert_book(input_path: str, output_path: str, cover_path: str = None) -> tuple[bool, str]:
-    """Конвертация с опциями для отображения обложки в библиотеке Kindle"""
+    """Конвертация с правильным формированием аргументов для миниатюры в библиотеке"""
     try:
         input_abs = str(Path(input_path).resolve())
         output_abs = str(Path(output_path).resolve())
         cover_abs = str(Path(cover_path).resolve()) if cover_path else None
         
+        # Формируем команду — КАЖДАЯ опция и её значение как отдельный элемент списка!
         cmd = ["ebook-convert", input_abs, output_abs]
         
-        # Добавляем обложку если найдена
         if cover_abs and Path(cover_abs).exists():
             cmd.extend(["--cover", cover_abs])
             logger.info(f"Конвертация с обложкой: {cover_abs}")
         else:
             logger.info("Конвертация без обложки")
         
-        # 🔑 КРИТИЧЕСКИ ВАЖНЫЕ ОПЦИИ ДЛЯ МИНИАТЮРЫ В БИБЛИОТЕКЕ:
+        # 🔑 КРИТИЧЕСКИ ВАЖНО: каждая опция и значение — отдельные элементы списка!
         cmd.extend([
-            "--output-profile", "kindle_pw3",  # Правильные метаданные для современных Kindle
-            "--pretty-print",                  # Корректная структура XML метаданных
-            "--no-inline-toc",                 # Не мешает обложке в метаданных
-            "--cover-margin", "0",             # Без отступов у обложки
+            "--output-profile", "kindle_pw3",  # ← два элемента
+            "--pretty-print",                   # ← один элемент (флаг)
+            "--no-inline-toc",                  # ← один элемент (флаг)
+            "--cover-margin", "0",              # ← два элемента (ключ + значение)
         ])
+        
+        logger.debug(f"Команда: {' '.join(cmd)}")
         
         result = subprocess.run(
             cmd,
@@ -292,7 +294,7 @@ def convert_book(input_path: str, output_path: str, cover_path: str = None) -> t
     except Exception as e:
         logger.error(f"Ошибка конвертации: {e}", exc_info=True)
         return False, str(e)[:150]
-
+        
 
 async def conversion_worker(application: Application):
     logger.info("🔄 Воркер запущен")

@@ -8,6 +8,7 @@ import zipfile
 import shutil
 from pathlib import Path
 from uuid import uuid4
+from PIL import Image  # Нужно установить: pip install Pillow
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.constants import ParseMode
@@ -95,7 +96,12 @@ def extract_metadata(input_path: str) -> dict:
             errors='replace'
         )
         
-        metadata = {"title": "Без названия", "authors": ["Неизвестен"]}
+        metadata = {
+            "title": "Без названия", 
+            "authors": ["Неизвестен"],
+            "series": None,
+            "series_index": None
+        }
         
         for line in result.stdout.splitlines():
             line = line.strip()
@@ -107,12 +113,25 @@ def extract_metadata(input_path: str) -> dict:
                 val = line[10:].strip()
                 if val and val.lower() != "unknown" and val:
                     metadata["authors"] = [a.strip() for a in val.split(",")]
+            elif line.startswith("Series:"):
+                val = line[7:].strip()
+                if val and val.lower() != "unknown" and val:
+                    metadata["series"] = val
+            elif line.startswith("Series Index:"):
+                val = line[13:].strip()
+                if val:
+                    metadata["series_index"] = val
         
         return metadata
         
     except Exception as e:
         logger.warning(f"Ошибка извлечения метаданных: {e}")
-        return {"title": "Без названия", "authors": ["Неизвестен"]}
+        return {
+            "title": "Без названия", 
+            "authors": ["Неизвестен"],
+            "series": None,
+            "series_index": None
+        }
 
 
 def extract_cover(input_path: str, cover_path: str) -> bool:
@@ -170,37 +189,6 @@ def extract_cover(input_path: str, cover_path: str) -> bool:
             except Exception as e:
                 logger.debug(f"Ошибка при парсинге FB2: {e}")
         
-        # Метод 3: попробуем конвертировать в PDF с обложкой и извлечь
-        try:
-            temp_output = Path(input_path).with_suffix('.temp.pdf')
-            cmd = ["ebook-convert", input_path, str(temp_output)]
-            
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                timeout=60
-            )
-            
-            # Ищем обложку в папке с файлом
-            possible_covers = [
-                Path(cover_path),
-                Path(input_path).parent / "cover.jpg",
-                Path(input_path).parent / "cover.png",
-            ]
-            
-            for cover in possible_covers:
-                if cover.exists() and cover.stat().st_size > 1000:
-                    shutil.copy2(cover, cover_path)
-                    if temp_output.exists():
-                        temp_output.unlink()
-                    return True
-            
-            if temp_output.exists():
-                temp_output.unlink()
-                
-        except Exception as e:
-            logger.debug(f"Метод через PDF не сработал: {e}")
-        
         return False
         
     except Exception as e:
@@ -208,24 +196,109 @@ def extract_cover(input_path: str, cover_path: str) -> bool:
         return False
 
 
-def convert_book_simple(input_path: str, output_path: str, cover_path: str = None) -> tuple[bool, str]:
-    """Простая конвертация книги"""
+def optimize_cover_for_kindle(cover_path: str) -> bool:
+    """Оптимизирует обложку для Kindle"""
+    try:
+        if not Path(cover_path).exists():
+            return False
+        
+        with Image.open(cover_path) as img:
+            # Конвертируем в RGB если нужно
+            if img.mode in ('RGBA', 'LA', 'P'):
+                rgb_img = Image.new('RGB', img.size, (255, 255, 255))
+                if img.mode == 'P':
+                    img = img.convert('RGBA')
+                rgb_img.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                img = rgb_img
+            
+            # Оптимальные размеры для Kindle
+            # Минимум 600x800 для хорошего отображения
+            target_width = 800
+            target_height = 1200
+            
+            # Сохраняем пропорции
+            img.thumbnail((target_width, target_height), Image.Resampling.LANCZOS)
+            
+            # Сохраняем в высоком качестве
+            optimized_path = cover_path.replace('.jpg', '_optimized.jpg')
+            img.save(optimized_path, 'JPEG', quality=90, optimize=True)
+            
+            # Заменяем оригинальную обложку
+            shutil.move(optimized_path, cover_path)
+            
+            logger.info(f"Обложка оптимизирована: {img.size[0]}x{img.size[1]}")
+            return True
+            
+    except Exception as e:
+        logger.warning(f"Не удалось оптимизировать обложку: {e}")
+        return False
+
+
+def convert_book_for_kindle(input_path: str, output_path: str, metadata: dict, cover_path: str = None) -> tuple[bool, str]:
+    """Конвертация книги с метаданными для Kindle"""
     try:
         cmd = ["ebook-convert", input_path, output_path]
         
+        # Добавляем метаданные
+        if metadata.get("title"):
+            # Экранируем кавычки в названии
+            title = metadata["title"].replace('"', '\\"')
+            cmd.extend(["--title", title])
+        
+        if metadata.get("authors"):
+            # Объединяем авторов, экранируем кавычки
+            authors = ", ".join(metadata["authors"])
+            authors = authors.replace('"', '\\"')
+            cmd.extend(["--authors", authors])
+        
+        if metadata.get("series"):
+            series = metadata["series"].replace('"', '\\"')
+            cmd.extend(["--series", series])
+        
+        if metadata.get("series_index"):
+            cmd.extend(["--series-index", str(metadata["series_index"])])
+        
         # Добавляем обложку если есть
         if cover_path and Path(cover_path).exists() and Path(cover_path).stat().st_size > 1000:
+            # Оптимизируем обложку для Kindle
+            optimize_cover_for_kindle(cover_path)
+            
             cmd.extend(["--cover", cover_path])
-            logger.info(f"Конвертация с обложкой")
+            logger.info(f"Конвертация с обложкой ({Path(cover_path).stat().st_size} байт)")
         else:
             cmd.append("--no-default-epub-cover")
             logger.info("Конвертация без обложки")
         
-        # Для MOBI добавляем специфичные опции
-        if output_path.lower().endswith('.mobi'):
-            cmd.extend(["--mobi-keep-original-images"])
+        # ОПЦИИ ДЛЯ МИНИАТЮРЫ В KINDLE
+        output_ext = Path(output_path).suffix.lower()
         
-        logger.debug(f"Команда: {' '.join(cmd)}")
+        if output_ext == ".mobi":
+            # Критические опции для MOBI (старые Kindle)
+            cmd.extend([
+                "--mobi-keep-original-images",
+                "--share-not-sync",           # Для отображения миниатюры
+                "--personal-doc", "Y",        # Разрешаем личные документы
+                "--mobi-file-type", "both",   # Для совместимости
+                "--dont-compress",            # Не сжимать сильно
+            ])
+        elif output_ext == ".azw3":
+            # Опции для AZW3 (новые Kindle)
+            cmd.extend([
+                "--dont-compress",
+                "--no-inline-toc",            # Без встроенного оглавления
+                "--disable-font-rescaling",
+            ])
+        
+        # Общие опции для улучшения метаданных
+        cmd.extend([
+            "--metadata",                     # Явно указываем метаданные
+            "--smarten-punctuation",          # Улучшаем пунктуацию
+            "--chapter", "//h:h1",            # Главы по h1
+            "--chapter-mark", "pagebreak",    # Разрывы страниц для глав
+            "--page-breaks-before", "//*[name()='h1' or name()='h2']",
+        ])
+        
+        logger.info(f"Выполняю: {' '.join(cmd[:10])}...")
         
         result = subprocess.run(
             cmd,
@@ -236,25 +309,28 @@ def convert_book_simple(input_path: str, output_path: str, cover_path: str = Non
             errors='replace'
         )
         
-        # Логируем ошибки если есть
+        # Логируем вывод для отладки
+        if result.stdout:
+            logger.debug(f"Stdout: {result.stdout[:200]}")
         if result.stderr:
-            error_lines = [line.strip() for line in result.stderr.split('\n') if line.strip()]
-            if error_lines and not error_lines[0].startswith("Usage:"):
-                logger.warning(f"Stderr конвертации: {result.stderr[:500]}")
+            # Фильтруем стандартные предупреждения
+            error_lines = [line for line in result.stderr.split('\n') 
+                          if line.strip() and not line.startswith("Usage:")]
+            if error_lines:
+                logger.warning(f"Stderr: {error_lines[0][:200]}")
         
         output_p = Path(output_path)
         if result.returncode != 0 or not output_p.exists() or output_p.stat().st_size == 0:
             error_msg = f"Код ошибки: {result.returncode}"
             if result.stderr:
-                # Берем первую значимую строку ошибки
                 for line in result.stderr.split('\n'):
                     if line.strip() and not line.startswith("Usage:"):
                         error_msg = line.strip()[:200]
                         break
             return False, error_msg
         
-        # Проверяем наличие обложки в выходном файле
-        cover_check = ""
+        # ПРОВЕРЯЕМ МЕТАДАННЫЕ В ВЫХОДНОМ ФАЙЛЕ
+        meta_check = ""
         try:
             check_result = subprocess.run(
                 ["ebook-meta", output_path],
@@ -262,25 +338,55 @@ def convert_book_simple(input_path: str, output_path: str, cover_path: str = Non
                 text=True,
                 timeout=30
             )
-            if "Cover:" in check_result.stdout or "Has cover:" in check_result.stdout:
-                for line in check_result.stdout.split('\n'):
-                    if "Cover:" in line or "Has cover:" in line:
-                        if "yes" in line.lower() or "true" in line.lower():
-                            cover_check = " ✓ с обложкой"
-                        else:
-                            cover_check = " ✗ без обложки"
-                        break
+            
+            # Ищем название и автора
+            has_title = False
+            has_author = False
+            has_cover = False
+            
+            for line in check_result.stdout.split('\n'):
+                line = line.strip()
+                if line.startswith("Title:"):
+                    val = line[6:].strip()
+                    if val and val.lower() != "unknown" and val:
+                        has_title = True
+                elif line.startswith("Author(s):"):
+                    val = line[10:].strip()
+                    if val and val.lower() != "unknown" and val:
+                        has_author = True
+                elif "Cover:" in line or "Has cover:" in line:
+                    if "yes" in line.lower() or "true" in line.lower():
+                        has_cover = True
+            
+            meta_check_parts = []
+            if has_title:
+                meta_check_parts.append("✓ название")
+            else:
+                meta_check_parts.append("✗ название")
+                
+            if has_author:
+                meta_check_parts.append("✓ автор")
+            else:
+                meta_check_parts.append("✗ автор")
+                
+            if has_cover:
+                meta_check_parts.append("✓ обложка")
+            else:
+                meta_check_parts.append("✗ обложка")
+            
+            meta_check = " | " + " | ".join(meta_check_parts)
+            
         except Exception as e:
-            logger.debug(f"Не удалось проверить обложку: {e}")
-            cover_check = ""
+            logger.debug(f"Не удалось проверить метаданные: {e}")
+            meta_check = ""
         
         size_info = f"{output_p.stat().st_size / 1024 / 1024:.2f} МБ"
-        return True, f"{size_info}{cover_check}"
+        return True, f"{size_info}{meta_check}"
         
     except subprocess.TimeoutExpired:
         return False, "Таймаут конвертации"
     except Exception as e:
-        logger.error(f"Ошибка конвертации: {e}")
+        logger.error(f"Ошибка конвертации: {e}", exc_info=True)
         return False, str(e)[:150]
 
 
@@ -312,6 +418,7 @@ async def conversion_worker(application: Application):
                 if has_cover:
                     cover_size = Path(cover_path).stat().st_size if Path(cover_path).exists() else 0
                     status += f"\n✅ Обложка найдена ({cover_size/1024:.1f} КБ)"
+                    status += f"\n🔧 Оптимизирую для Kindle..."
                 else:
                     status += "\n⚠️ Обложка не найдена"
                 
@@ -324,10 +431,11 @@ async def conversion_worker(application: Application):
             except Exception as e:
                 logger.warning(f"Не удалось обновить статус: {e}")
             
-            # Конвертируем
-            success, diag = convert_book_simple(
+            # Конвертируем с улучшенной функцией
+            success, diag = convert_book_for_kindle(
                 unpacked_path,
                 task["output_path"],
+                metadata,
                 cover_path if has_cover else None
             )
             
@@ -340,6 +448,22 @@ async def conversion_worker(application: Application):
                 
                 caption = f"✅ Конвертация завершена\n📚 {title}\n👤 {author}\n💾 {diag}"
                 
+                # Дополнительная информация о миниатюрах
+                extra_info = ""
+                if task["output_format"] == "mobi":
+                    extra_info = (
+                        "\n\n📱 <b>Для отображения миниатюры на Kindle:</b>\n"
+                        "1. Отправьте файл на email Kindle\n"
+                        "2. В теме письма добавьте <code>convert</code>\n"
+                        "3. Или используйте Calibre для копирования"
+                    )
+                elif task["output_format"] == "azw3":
+                    extra_info = (
+                        "\n\n📱 <b>Для лучшего отображения:</b>\n"
+                        "• Используйте кабель USB\n"
+                        "• Или отправьте через email"
+                    )
+                
                 await application.bot.send_document(
                     chat_id=task["user_id"],
                     document=open(output_p, "rb"),
@@ -347,6 +471,13 @@ async def conversion_worker(application: Application):
                     caption=caption,
                     parse_mode=ParseMode.HTML,
                 )
+                
+                if extra_info:
+                    await application.bot.send_message(
+                        chat_id=task["user_id"],
+                        text=extra_info,
+                        parse_mode=ParseMode.HTML
+                    )
                 
                 await application.bot.send_message(
                     chat_id=task["user_id"],
@@ -357,10 +488,10 @@ async def conversion_worker(application: Application):
                 error_msg = (
                     f"❌ Ошибка конвертации <b>{title}</b>:\n"
                     f"<code>{diag}</code>\n\n"
-                    f"Попробуйте:\n"
-                    f"1. Конвертировать в другой формат (AZW3 вместо MOBI)\n"
+                    f"<b>Попробуйте:</b>\n"
+                    f"1. Использовать формат AZW3 вместо MOBI\n"
                     f"2. Отправить книгу заново\n"
-                    f"3. Проверить формат исходного файла"
+                    f"3. Проверить исходный файл"
                 )
                 await application.bot.send_message(
                     chat_id=task["user_id"],
@@ -402,13 +533,17 @@ async def conversion_worker(application: Application):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "📚 <b>KindleGarden Bot</b>\n\n"
-        "Отправьте мне книгу в формате FB2 или EPUB, и я конвертирую её для Kindle!\n\n"
-        "Поддерживаемые форматы:\n"
-        "• FB2 (.fb2)\n"
-        "• FB2.ZIP (.fb2.zip)\n"
-        "• EPUB (.epub)\n\n"
-        "Максимальный размер: 50 МБ",
+        "📚 <b>KindleGarden Bot v3</b>\n\n"
+        "<b>Улучшенная конвертация с метаданными!</b>\n\n"
+        "✅ <b>Что нового:</b>\n"
+        "• Правильное заполнение названия и автора\n"
+        "• Оптимизация обложек для Kindle\n"
+        "• Лучшая поддержка миниатюр\n\n"
+        "<b>Форматы:</b>\n"
+        "• FB2 / FB2.ZIP\n"
+        "• EPUB\n\n"
+        "<b>Совет:</b> Используйте AZW3 для новых Kindle\n"
+        "для гарантированного отображения обложек.",
         parse_mode=ParseMode.HTML,
         reply_markup=MAIN_REPLY_KEYBOARD
     )
@@ -416,27 +551,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = (
-        "📚 <b>Помощь по использованию бота</b>\n\n"
+        "📚 <b>KindleGarden - помощь</b>\n\n"
         
-        "✅ <b>Как использовать:</b>\n"
-        "1. Нажмите '📚 Отправить книгу'\n"
-        "2. Выберите файл FB2 или EPUB\n"
-        "3. Дождитесь конвертации\n"
-        "4. Получите готовый файл\n\n"
+        "✅ <b>Как работают метаданные и обложки:</b>\n"
+        "1. Бот извлекает название, автора и обложку\n"
+        "2. Оптимизирует обложку для Kindle (800x1200)\n"
+        "3. Встраивает метаданные в книгу\n"
+        "4. Использует специальные настройки для миниатюр\n\n"
         
-        "⚙️ <b>Настройки формата:</b>\n"
-        "• AZW3 - для новых Kindle\n"
-        "• MOBI - для старых Kindle\n"
-        "• EPUB - для других устройств\n\n"
+        "🖼️ <b>Почему миниатюра может не отображаться:</b>\n"
+        "• <b>MOBI</b>: Требуется отправка через email с темой 'convert'\n"
+        "• <b>AZW3</b>: Обычно работает через USB\n"
+        "• Размер обложки менее 600x800 пикселей\n"
+        "• Старый Kindle (до 5 поколения)\n\n"
         
-        "🖼️ <b>Об обложках:</b>\n"
-        "Бот пытается извлечь обложку из книги.\n"
-        "Если обложка не извлекается, книга будет без неё.\n"
-        "Это нормально для некоторых файлов.\n\n"
+        "⚙️ <b>Рекомендации по форматам:</b>\n"
+        "• <b>AZW3</b> - лучшая поддержка, новые Kindle\n"
+        "• <b>MOBI</b> - старые Kindle, отправка через email\n"
+        "• <b>EPUB</b> - другие устройства\n\n"
         
-        "⏱️ <b>Время конвертации:</b>\n"
-        "Обычно 1-3 минуты\n"
-        "Очередь: 5 файлов одновременно"
+        "📧 <b>Для MOBI миниатюр:</b>\n"
+        "Отправьте файл на email Kindle\n"
+        "Тема письма: <code>convert</code>\n"
+        "Или используйте Calibre\n\n"
+        
+        "⏱️ <b>Ограничения:</b>\n"
+        "• Размер: до 50 МБ\n"
+        "• Время: до 5 минут\n"
+        "• Очередь: 5 файлов"
     )
     await update.message.reply_text(
         message,
@@ -449,15 +591,26 @@ async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_id = update.effective_user.id
     current = settings_db.get_preferred_format(user_id)
     
+    # Описание форматов с советами по миниатюрам
+    formats_info = {
+        "azw3": "📘 AZW3 - лучшие миниатюры (USB, новые Kindle)",
+        "mobi": "📙 MOBI - совместимость (email, старые Kindle)",
+        "epub": "📖 EPUB - другие читалки"
+    }
+    
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{'✅ ' if 'azw3' == current else ''}📘 AZW3", callback_data="setfmt:azw3")],
-        [InlineKeyboardButton(f"{'✅ ' if 'epub' == current else ''}📖 EPUB", callback_data="setfmt:epub")],
-        [InlineKeyboardButton(f"{'✅ ' if 'mobi' == current else ''}📙 MOBI", callback_data="setfmt:mobi")]
+        [InlineKeyboardButton(
+            f"{'✅ ' if fmt == current else ''}{desc}", 
+            callback_data=f"setfmt:{fmt}"
+        )] for fmt, desc in formats_info.items()
     ])
     
     await update.message.reply_text(
         f"⚙️ <b>Текущий формат:</b> {current.upper()}\n\n"
-        f"Выберите формат для конвертации:",
+        f"<b>Советы по миниатюрам:</b>\n"
+        f"• AZW3 - миниатюры через USB\n"
+        f"• MOBI - миниатюры через email\n"
+        f"• EPUB - без гарантий для Kindle",
         parse_mode=ParseMode.HTML,
         reply_markup=kb
     )
@@ -470,8 +623,15 @@ async def handle_format_setting(update: Update, context: ContextTypes.DEFAULT_TY
     
     settings_db.set_preferred_format(update.effective_user.id, fmt)
     
+    # Совет в зависимости от формата
+    advice = {
+        "mobi": "\n\n⚠️ <b>Для миниатюр MOBI:</b>\nОтправляйте файлы на email Kindle\nс темой 'convert'",
+        "azw3": "\n\n✅ <b>Для миниатюр AZW3:</b>\nИспользуйте USB кабель\nили Calibre для копирования",
+        "epub": "\n\n📖 <b>Для EPUB:</b>\nФормат для других устройств,\nне гарантирует миниатюры на Kindle"
+    }.get(fmt, "")
+    
     await query.edit_message_text(
-        f"✅ Формат изменен на <b>{fmt.upper()}</b>",
+        f"✅ Формат изменен на <b>{fmt.upper()}</b>{advice}",
         parse_mode=ParseMode.HTML
     )
     await query.message.reply_text(
@@ -555,10 +715,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await conversion_queue.put(task)
     
+    format_advice = {
+        "azw3": "AZW3 (миниатюры через USB)",
+        "mobi": "MOBI (миниатюры через email)",
+        "epub": "EPUB (другие устройства)"
+    }
+    
     msg = await update.message.reply_text(
         f"✅ Добавлено в очередь ({conversion_queue.qsize()}/5)\n"
-        f"Формат: <b>{task['output_format'].upper()}</b>\n\n"
-        f"⏳ Ожидайте начала конвертации...",
+        f"Формат: <b>{task['output_format'].upper()}</b>\n"
+        f"{format_advice.get(task['output_format'], '')}\n\n"
+        f"⏳ Извлекаю метаданные и обложку...",
         parse_mode=ParseMode.HTML
     )
     task["message_id"] = msg.message_id
@@ -569,7 +736,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if t == "📚 Отправить книгу":
         await update.message.reply_text(
             "📎 Отправьте FB2 или EPUB файл\n"
-            "Максимальный размер: 50 МБ",
+            "Максимальный размер: 50 МБ\n\n"
+            "✅ <b>Новые возможности:</b>\n"
+            "• Заполнение названия и автора\n"
+            "• Оптимизация обложек\n"
+            "• Лучшие миниатюры для Kindle",
+            parse_mode=ParseMode.HTML,
             reply_markup=MAIN_REPLY_KEYBOARD
         )
     elif t == "⚙️ Настройки":
@@ -599,8 +771,16 @@ async def post_init(app: Application) -> None:
             logger.error(f"❌ {tool} не найден: {e}")
             raise RuntimeError(f"{tool} не найден. Установите Calibre: sudo apt install calibre")
     
+    # Проверяем наличие Pillow (PIL)
+    try:
+        import PIL
+        logger.info("✅ Pillow (PIL) доступен")
+    except ImportError:
+        logger.warning("❌ Pillow не установлен. Обложки не будут оптимизированы.")
+        logger.info("Установите: pip install Pillow")
+    
     asyncio.create_task(conversion_worker(app))
-    logger.info("✅ Бот готов к работе")
+    logger.info("✅ Бот готов к работе с улучшенной конвертацией")
 
 
 def main() -> None:
@@ -618,7 +798,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(handle_format_setting, pattern="^setfmt:"))
     
-    logger.info("🚀 Бот запущен")
+    logger.info("🚀 Бот запущен с поддержкой метаданных и оптимизированных обложек")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

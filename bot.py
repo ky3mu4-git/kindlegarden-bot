@@ -228,28 +228,20 @@ def extract_cover(input_path: str, cover_path: str) -> bool:
 
 
 def convert_book(input_path: str, output_path: str, cover_path: str = None) -> tuple[bool, str]:
-    """Конвертация с гарантированным вшиванием обложки в метаданные"""
+    """Конвертация + принудительное обновление метаданных обложкой для миниатюры"""
     try:
         input_abs = str(Path(input_path).resolve())
         output_abs = str(Path(output_path).resolve())
         
-        # 🔑 МИНИМАЛЬНАЯ РАБОЧАЯ КОМАНДА (без лишних опций, которые ломают парсинг)
+        # Шаг 1: конвертируем БЕЗ обложки (чистая конвертация)
         cmd = ["ebook-convert", input_abs, output_abs]
         
-        # Добавляем обложку ТОЛЬКО если она существует и достаточно большая
-        if cover_path and Path(cover_path).exists() and Path(cover_path).stat().st_size > 500:
-            cmd.extend(["--cover", cover_path])
-            logger.info(f"Добавлена обложка: {cover_path}")
-        else:
-            logger.info("Обложка отсутствует — конвертация без неё")
-        
-        # 🔑 КРИТИЧЕСКИ ВАЖНО ДЛЯ СТАРЫХ KINDLE (1-2 поколение):
+        # Для MOBI на старых Kindle — сохраняем оригинальные изображения
         output_ext = Path(output_abs).suffix.lower()
         if output_ext == ".mobi":
-            cmd.extend(["--mobi-keep-original-images"])  # Сохраняет оригинальные изображения для старых устройств
+            cmd.append("--mobi-keep-original-images")
         
-        logger.debug(f"Команда: {' '.join(cmd)}")
-        
+        logger.info(f"Конвертация: {Path(input_abs).name} → {Path(output_abs).name}")
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -260,28 +252,31 @@ def convert_book(input_path: str, output_path: str, cover_path: str = None) -> t
         )
         
         output_p = Path(output_abs)
-        if result.returncode != 0:
-            logger.error(f"STDERR: {result.stderr[:500]}")
-            return False, f"Код {result.returncode}"
+        if result.returncode != 0 or not output_p.exists() or output_p.stat().st_size == 0:
+            return False, f"Ошибка конвертации (код {result.returncode})"
         
-        if not output_p.exists() or output_p.stat().st_size == 0:
-            return False, "Файл не создан"
-        
-        # 🔑 ПРОВЕРЯЕМ: есть ли обложка В РЕЗУЛЬТАТЕ
+        # Шаг 2: ЕСЛИ есть обложка — принудительно вшиваем её в метаданные
         has_cover = False
-        try:
-            meta = subprocess.run(
-                ["ebook-meta", str(output_p)],
+        if cover_path and Path(cover_path).exists() and Path(cover_path).stat().st_size > 500:
+            logger.info(f"Вшиваем обложку в метаданные: {cover_path}")
+            meta_cmd = ["ebook-meta", output_abs, "--cover", cover_path]
+            meta_result = subprocess.run(
+                meta_cmd,
                 capture_output=True,
                 text=True,
-                timeout=10,
+                timeout=30,
                 encoding='utf-8',
                 errors='replace'
             )
-            has_cover = "cover" in meta.stdout.lower() or "Cover" in meta.stdout
-        except:
-            pass
+            if meta_result.returncode == 0:
+                has_cover = True
+                logger.info("Обложка успешно вшита в метаданные")
+            else:
+                logger.warning(f"Не удалось вшить обложку в метаданные (код {meta_result.returncode})")
+        else:
+            logger.info("Обложка отсутствует — пропускаем вшивание")
         
+        # Проверяем результат
         size_info = f"{output_p.stat().st_size / 1024:.1f} КБ"
         cover_info = " ✓ миниатюра в библиотеке" if has_cover else " ⚠️ обложка внутри, но нет миниатюры"
         return True, f"{size_info}{cover_info}"

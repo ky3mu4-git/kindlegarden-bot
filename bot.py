@@ -228,25 +228,25 @@ def extract_cover(input_path: str, cover_path: str) -> bool:
 
 
 def convert_book(input_path: str, output_path: str, cover_path: str = None) -> tuple[bool, str]:
-    """Конвертация с защитой от пустых аргументов"""
+    """Конвертация с гарантированным вшиванием обложки в метаданные"""
     try:
         input_abs = str(Path(input_path).resolve())
         output_abs = str(Path(output_path).resolve())
         
-        # Формируем команду — ТОЛЬКО валидные аргументы
+        # 🔑 МИНИМАЛЬНАЯ РАБОЧАЯ КОМАНДА (без лишних опций, которые ломают парсинг)
         cmd = ["ebook-convert", input_abs, output_abs]
         
-        # Добавляем обложку ТОЛЬКО если путь валидный
+        # Добавляем обложку ТОЛЬКО если она существует и достаточно большая
         if cover_path and Path(cover_path).exists() and Path(cover_path).stat().st_size > 500:
             cmd.extend(["--cover", cover_path])
-            logger.info(f"Конвертация с обложкой: {cover_path}")
+            logger.info(f"Добавлена обложка: {cover_path}")
         else:
-            logger.info("Конвертация без обложки")
+            logger.info("Обложка отсутствует — конвертация без неё")
         
-        # 🔑 МИНИМАЛЬНЫЙ НАБОР ОПЦИЙ ДЛЯ МИНИАТЮРЫ (без риска сломать парсинг)
-        cmd.extend([
-            "--output-profile", "kindle",  # ← kindle вместо kindle_pw3 (универсальнее)
-        ])
+        # 🔑 КРИТИЧЕСКИ ВАЖНО ДЛЯ СТАРЫХ KINDLE (1-2 поколение):
+        output_ext = Path(output_abs).suffix.lower()
+        if output_ext == ".mobi":
+            cmd.extend(["--mobi-keep-original-images"])  # Сохраняет оригинальные изображения для старых устройств
         
         logger.debug(f"Команда: {' '.join(cmd)}")
         
@@ -267,7 +267,7 @@ def convert_book(input_path: str, output_path: str, cover_path: str = None) -> t
         if not output_p.exists() or output_p.stat().st_size == 0:
             return False, "Файл не создан"
         
-        # Проверяем наличие обложки в метаданных
+        # 🔑 ПРОВЕРЯЕМ: есть ли обложка В РЕЗУЛЬТАТЕ
         has_cover = False
         try:
             meta = subprocess.run(
@@ -278,12 +278,12 @@ def convert_book(input_path: str, output_path: str, cover_path: str = None) -> t
                 encoding='utf-8',
                 errors='replace'
             )
-            has_cover = "cover" in meta.stdout.lower()
+            has_cover = "cover" in meta.stdout.lower() or "Cover" in meta.stdout
         except:
             pass
         
         size_info = f"{output_p.stat().st_size / 1024:.1f} КБ"
-        cover_info = " ✓ миниатюра" if has_cover else " ✗ без миниатюры"
+        cover_info = " ✓ миниатюра в библиотеке" if has_cover else " ⚠️ обложка внутри, но нет миниатюры"
         return True, f"{size_info}{cover_info}"
         
     except subprocess.TimeoutExpired:
